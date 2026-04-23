@@ -13,6 +13,14 @@ echo "=================================================="
 echo ""
 
 # ----------------------------------------------------------------
+# Enable passwordless sudo for this setup (Codespace container is ephemeral)
+# ----------------------------------------------------------------
+echo "→ Configuring sudo for automated setup..."
+echo "node ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/node-nopasswd > /dev/null
+sudo chmod 0440 /etc/sudoers.d/node-nopasswd
+echo "  ✓ Sudo configured"
+
+# ----------------------------------------------------------------
 # Install PostgreSQL 15
 # ----------------------------------------------------------------
 echo "→ Installing PostgreSQL 15..."
@@ -34,7 +42,7 @@ sudo service postgresql start
 echo "  ✓ PostgreSQL service running"
 
 # ----------------------------------------------------------------
-# Create the database and a development user
+# Create the database and set the postgres user password
 # ----------------------------------------------------------------
 echo "→ Creating threados_dev database..."
 
@@ -45,6 +53,17 @@ EOF
 
 echo "  ✓ Database 'threados_dev' created"
 echo "  ✓ User 'postgres' password set"
+
+# ----------------------------------------------------------------
+# Configure PostgreSQL to accept password authentication on localhost
+# ----------------------------------------------------------------
+echo "→ Configuring PostgreSQL authentication..."
+
+PG_HBA=$(sudo -u postgres psql -t -P format=unaligned -c "SHOW hba_file;")
+sudo sed -i 's/^local\s*all\s*postgres\s*peer/local all postgres md5/' "$PG_HBA"
+sudo service postgresql restart
+
+echo "  ✓ Authentication configured"
 
 # ----------------------------------------------------------------
 # Verify the connection works
