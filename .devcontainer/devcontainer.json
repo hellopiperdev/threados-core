@@ -1,0 +1,27 @@
+{
+  "name": "ThreadOS Core Development",
+  "image": "mcr.microsoft.com/devcontainers/javascript-node:18-bullseye",
+  "postCreateCommand": "bash .devcontainer/setup.sh",
+  "forwardPorts": [3000, 5432],
+  "portsAttributes": {
+    "3000": {
+      "label": "ThreadOS Core API",
+      "onAutoForward": "notify"
+    },
+    "5432": {
+      "label": "PostgreSQL",
+      "onAutoForward": "silent"
+    }
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "dbaeumer.vscode-eslint",
+        "esbenp.prettier-vscode",
+        "mtxr.sqltools",
+        "mtxr.sqltools-driver-pg"
+      ]
+    }
+  },
+  "remoteUser": "node"
+}
