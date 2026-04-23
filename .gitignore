@@ -1,0 +1,71 @@
+# Environment files (may contain secrets)
+.env
+.env.local
+.env.development
+.env.production
+.env.staging
+.env.test
+
+# Allow example env files (these show structure without secrets)
+!.env.example
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+
+# Build outputs
+dist/
+build/
+out/
+
+# Testing
+coverage/
+.nyc_output/
+*.lcov
+
+# Logs
+logs/
+*.log
+
+# Operating system files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# IDE and editor files
+.vscode/
+.idea/
+*.iml
+*.sublime-*
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Database
+*.sql.backup
+*.dump
+postgres-data/
+
+# Cloud credentials - NEVER commit these
+*.pem
+*.key
+*.crt
+*.cert
+service-account*.json
+gcs-key.json
+credentials.json
+
+# Python (for future Python components)
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+.venv/
