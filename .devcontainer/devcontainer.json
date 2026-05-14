@@ -2,6 +2,7 @@
   "name": "ThreadOS Core Development",
   "image": "mcr.microsoft.com/devcontainers/javascript-node:18-bullseye",
   "postCreateCommand": "bash .devcontainer/setup.sh",
+  "postStartCommand": "sudo service postgresql start",
   "forwardPorts": [3000, 5432],
   "portsAttributes": {
     "3000": {

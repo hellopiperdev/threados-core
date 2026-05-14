@@ -1,0 +1,16 @@
+{
+  "name": "threados-core",
+  "version": "0.1.0",
+  "description": "ThreadOS Core - The vertical-agnostic trust layer",
+  "private": true,
+  "scripts": {
+    "migrate": "node db/migrate.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "pg": "^8.13.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
