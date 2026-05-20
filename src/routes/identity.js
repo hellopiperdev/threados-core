@@ -55,6 +55,31 @@ function tenantContext(req, res, next) {
 }
 
 // ----------------------------------------------------------------------------
+// Content-Type check middleware
+// ----------------------------------------------------------------------------
+//
+// Ensures POST requests with a body have Content-Type: application/json.
+// Without this check, Express silently ignores non-JSON bodies and our
+// validation reports the misleading "missing_identifier" instead of the
+// actual problem (wrong content type).
+// ----------------------------------------------------------------------------
+
+function requireJsonContent(req, res, next) {
+    const contentType = req.header('Content-Type') || '';
+
+    if (!contentType.toLowerCase().includes('application/json')) {
+        return res.status(415).json({
+            error: {
+                code: 'unsupported_media_type',
+                message: 'Content-Type must be application/json',
+            },
+        });
+    }
+
+    next();
+}
+
+// ----------------------------------------------------------------------------
 // POST /api/v1/identity/hash
 // ----------------------------------------------------------------------------
 //
@@ -94,7 +119,7 @@ function tenantContext(req, res, next) {
 //   }
 // ----------------------------------------------------------------------------
 
-router.post('/hash', tenantContext, async (req, res, next) => {
+router.post('/hash', requireJsonContent, tenantContext, async (req, res, next) => {
     try {
         // Validate request body shape
         const validation = validateIdentityHashRequest(req.body);
@@ -139,6 +164,20 @@ router.post('/hash', tenantContext, async (req, res, next) => {
                 error: {
                     code: 'tenant_not_found',
                     message: 'the specified tenant does not exist',
+                },
+            });
+        }
+
+        // Database is unreachable (ECONNREFUSED, ETIMEDOUT, etc.). This is a
+        // temporary service issue, not a request problem. 503 tells clients
+        // (and monitoring) to retry rather than treating it as a permanent
+        // server bug.
+        if (err.code === 'ECONNREFUSED' || err.code === 'ETIMEDOUT' || err.code === 'ENOTFOUND') {
+            console.error('Database connection failed:', err.code);
+            return res.status(503).json({
+                error: {
+                    code: 'service_unavailable',
+                    message: 'database temporarily unavailable, please retry',
                 },
             });
         }

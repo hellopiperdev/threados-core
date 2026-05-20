@@ -13,6 +13,10 @@ const identityRoutes = require('./routes/identity');
 function createServer() {
     const app = express();
 
+    // Suppress the X-Powered-By: Express header. Small information leak
+    // that doesn't help anyone but us.
+    app.disable('x-powered-by');
+
     // ------------------------------------------------------------------------
     // Global middleware
     // ------------------------------------------------------------------------
@@ -55,6 +59,39 @@ function createServer() {
     app.use('/api/v1/identity', identityRoutes);
 
     // ------------------------------------------------------------------------
+    // JSON parse error handler
+    // ------------------------------------------------------------------------
+    //
+    // When Express's JSON parser encounters malformed input, it throws an
+    // error with type 'entity.parse.failed'. We handle that specifically and
+    // return a 400 with a clear message - this is a client error, not a
+    // server error, and the client deserves an actionable response.
+    // ------------------------------------------------------------------------
+    
+    app.use((err, req, res, next) => {
+        if (err.type === 'entity.parse.failed') {
+            return res.status(400).json({
+                error: {
+                    code: 'invalid_json',
+                    message: 'request body is not valid JSON',
+                },
+            });
+        }
+
+        if (err.type === 'entity.too.large') {
+            return res.status(413).json({
+                error: {
+                    code: 'payload_too_large',
+                    message: 'request body exceeds maximum size',
+                },
+            });
+        }
+
+        // Pass other errors to the catch-all handler below
+        next(err);
+    });
+
+    // ------------------------------------------------------------------------
     // 404 handler
     // ------------------------------------------------------------------------
     // 
@@ -73,7 +110,7 @@ function createServer() {
     });
 
     // ------------------------------------------------------------------------
-    // Error handler
+    // Generic error handler (catch-all for unexpected errors)
     // ------------------------------------------------------------------------
     //
     // Catches uncaught errors in any route handler. Logs them and returns a

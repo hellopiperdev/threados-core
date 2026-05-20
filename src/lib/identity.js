@@ -220,85 +220,100 @@ async function resolveIdentity(tenantId, identifiers) {
     const displayEmail = email ? sanitizeEmail(email) : null;
     const displayPhone = phone ? sanitizePhone(phone) : null;
 
-    // Wrap find-or-create in a transaction. This prevents a race where two
-    // concurrent calls with the same identifiers both look up, both find
-    // nothing, and both try to insert - which would fail on the unique
-    // constraint. Inside a transaction we'd either find the row or be the
-    // one that inserted it.
-    return await withTransaction(async (client) => {
-        // Try to find existing identity using the inputs
-        // (We can't use findIdentityByHash here because it uses the pool;
-        // inside a transaction we need to use the transaction's client.)
-        
-        let existing = null;
+    try {
+        return await withTransaction(async (client) => {
+            // Try to find existing identity using the inputs.
+            let existing = null;
 
-        // Strategy 1: full match by resolution key
-        if (emailHash && phoneHash) {
+            // Strategy 1: full match by resolution key
+            if (emailHash && phoneHash) {
+                const resolutionKey = generateResolutionKey(emailHash, phoneHash);
+                const result = await client.query(
+                    `SELECT * FROM identities
+                     WHERE tenant_id = $1 AND resolution_key = $2 AND deleted_at IS NULL
+                     LIMIT 1`,
+                    [tenantId, resolutionKey]
+                );
+                if (result.rows.length > 0) existing = result.rows[0];
+            }
+
+            // Strategy 2: email hash
+            if (!existing && emailHash) {
+                const result = await client.query(
+                    `SELECT * FROM identities
+                     WHERE tenant_id = $1 AND email_hash = $2 AND deleted_at IS NULL
+                     LIMIT 1`,
+                    [tenantId, emailHash]
+                );
+                if (result.rows.length > 0) existing = result.rows[0];
+            }
+
+            // Strategy 3: phone hash
+            if (!existing && phoneHash) {
+                const result = await client.query(
+                    `SELECT * FROM identities
+                     WHERE tenant_id = $1 AND phone_hash = $2 AND deleted_at IS NULL
+                     LIMIT 1`,
+                    [tenantId, phoneHash]
+                );
+                if (result.rows.length > 0) existing = result.rows[0];
+            }
+
+            if (existing) {
+                return { identity: existing, created: false };
+            }
+
+            // No existing identity found - create one
             const resolutionKey = generateResolutionKey(emailHash, phoneHash);
+
             const result = await client.query(
+                `INSERT INTO identities (
+                    tenant_id,
+                    email_hash,
+                    phone_hash,
+                    resolution_key,
+                    display_email,
+                    display_phone,
+                    display_name,
+                    match_source
+                 )
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, 'deterministic')
+                 RETURNING *`,
+                [
+                    tenantId,
+                    emailHash,
+                    phoneHash,
+                    resolutionKey,
+                    displayEmail,
+                    displayPhone,
+                    name || null,
+                ]
+            );
+
+            return { identity: result.rows[0], created: true };
+        });
+    } catch (err) {
+        // Concurrent insert race: another transaction inserted the same identity
+        // first, so our transaction aborted with a unique constraint violation.
+        // The transaction is gone; we need a fresh query (which the pool provides)
+        // to fetch what the other transaction created.
+        if (err.code === '23505') {
+            const resolutionKey = generateResolutionKey(emailHash, phoneHash);
+            const fallback = await query(
                 `SELECT * FROM identities
                  WHERE tenant_id = $1 AND resolution_key = $2 AND deleted_at IS NULL
                  LIMIT 1`,
                 [tenantId, resolutionKey]
             );
-            if (result.rows.length > 0) existing = result.rows[0];
+
+            if (fallback.rows.length > 0) {
+                return { identity: fallback.rows[0], created: false };
+            }
         }
 
-        // Strategy 2: email hash
-        if (!existing && emailHash) {
-            const result = await client.query(
-                `SELECT * FROM identities
-                 WHERE tenant_id = $1 AND email_hash = $2 AND deleted_at IS NULL
-                 LIMIT 1`,
-                [tenantId, emailHash]
-            );
-            if (result.rows.length > 0) existing = result.rows[0];
-        }
-
-        // Strategy 3: phone hash
-        if (!existing && phoneHash) {
-            const result = await client.query(
-                `SELECT * FROM identities
-                 WHERE tenant_id = $1 AND phone_hash = $2 AND deleted_at IS NULL
-                 LIMIT 1`,
-                [tenantId, phoneHash]
-            );
-            if (result.rows.length > 0) existing = result.rows[0];
-        }
-
-        if (existing) {
-            return { identity: existing, created: false };
-        }
-
-        // No existing identity found - create one
-        const resolutionKey = generateResolutionKey(emailHash, phoneHash);
-
-        const result = await client.query(
-            `INSERT INTO identities (
-                tenant_id,
-                email_hash,
-                phone_hash,
-                resolution_key,
-                display_email,
-                display_phone,
-                display_name,
-                match_source
-             )
-             VALUES ($1, $2, $3, $4, $5, $6, $7, 'deterministic')
-             RETURNING *`,
-            [
-                tenantId,
-                emailHash,
-                phoneHash,
-                resolutionKey,
-                displayEmail,
-                displayPhone,
-                name || null,
-            ]
-        );
-
-        return { identity: result.rows[0], created: true };
-    });
+        // Any other error, re-raise
+        throw err;
+    }
 }
 
 // ----------------------------------------------------------------------------

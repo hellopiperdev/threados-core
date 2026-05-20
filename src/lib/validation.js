@@ -130,6 +130,12 @@ function validatePhone(value, fieldName = 'phone') {
     return { valid: true, value: trimmed };
 }
 
+// Matches any ASCII control character (0x00-0x1F) except whitespace we
+// consider acceptable (we permit tab and newline in case names span lines,
+// though we mostly don't expect either), plus the DEL character (0x7F).
+// Null bytes, vertical tabs, form feeds, etc. are rejected.
+const CONTROL_CHAR_REGEX = /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/;
+
 function validateName(value, fieldName = 'name') {
     if (value === undefined || value === null) {
         return { valid: true, value: null };
@@ -142,6 +148,17 @@ function validateName(value, fieldName = 'name') {
                 field: fieldName,
                 code: 'invalid_type',
                 message: `${fieldName} must be a string`,
+            },
+        };
+    }
+
+    if (CONTROL_CHAR_REGEX.test(value)) {
+        return {
+            valid: false,
+            error: {
+                field: fieldName,
+                code: 'invalid_characters',
+                message: `${fieldName} must not contain control characters`,
             },
         };
     }
