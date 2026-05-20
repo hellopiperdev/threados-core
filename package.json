@@ -6,9 +6,10 @@
   "scripts": {
     "start": "node src/index.js",
     "migrate": "node db/migrate.js",
-    "test": "node tests/lib/hashing.test.js && node tests/lib/identity.test.js",
+    "test": "node tests/lib/hashing.test.js && node tests/lib/identity.test.js && node tests/routes/identity.test.js",
     "test:hashing": "node tests/lib/hashing.test.js",
-    "test:identity": "node tests/lib/identity.test.js"
+    "test:identity": "node tests/lib/identity.test.js",
+    "test:routes": "node tests/routes/identity.test.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",

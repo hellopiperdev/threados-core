@@ -8,6 +8,7 @@
 // ============================================================================
 
 const express = require('express');
+const identityRoutes = require('./routes/identity');
 
 function createServer() {
     const app = express();
@@ -46,6 +47,12 @@ function createServer() {
             timestamp: new Date().toISOString(),
         });
     });
+
+    // ------------------------------------------------------------------------
+    // Identity routes
+    // ------------------------------------------------------------------------
+    
+    app.use('/api/v1/identity', identityRoutes);
 
     // ------------------------------------------------------------------------
     // 404 handler
