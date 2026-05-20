@@ -5,7 +5,8 @@
   "private": true,
   "scripts": {
     "start": "node src/index.js",
-    "migrate": "node db/migrate.js"
+    "migrate": "node db/migrate.js",
+    "test": "node tests/lib/hashing.test.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
