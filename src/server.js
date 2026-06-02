@@ -9,6 +9,7 @@
 
 const express = require('express');
 const identityRoutes = require('./routes/identity');
+const wellKnownRoutes = require('./routes/wellKnown');
 
 function createServer() {
     const app = express();
@@ -51,6 +52,17 @@ function createServer() {
             timestamp: new Date().toISOString(),
         });
     });
+
+    // ------------------------------------------------------------------------
+    // Well-known endpoints (RFC 8615)
+    // ------------------------------------------------------------------------
+    //
+    // Service metadata discovery, including our JWKS document. Lives at
+    // /.well-known/ rather than /api/v1/ because it's an industry standard
+    // location, not a versioned API endpoint.
+    // ------------------------------------------------------------------------
+    
+    app.use('/.well-known', wellKnownRoutes);
 
     // ------------------------------------------------------------------------
     // Identity routes
