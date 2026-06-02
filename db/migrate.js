@@ -29,6 +29,7 @@ const config = {
 };
 
 const SCHEMA_FILE = path.join(__dirname, 'schema.sql');
+const MIGRATIONS_FILE = path.join(__dirname, 'migrations.sql');
 
 // ----------------------------------------------------------------------------
 // Helpers for nicer output
@@ -122,6 +123,21 @@ async function runMigration() {
         process.exit(1);
     }
 
+    // Apply migrations on top of the base schema
+    if (fs.existsSync(MIGRATIONS_FILE)) {
+        log.step('Applying migrations from migrations.sql');
+        try {
+            const migrationsSQL = fs.readFileSync(MIGRATIONS_FILE, 'utf8');
+            await client.query(migrationsSQL);
+            log.success('Migrations applied successfully');
+        } catch (err) {
+            log.error('Failed to apply migrations');
+            log.info(err.message);
+            await client.end();
+            process.exit(1);
+        }
+    }
+
     log.section('Verifying schema');
 
     try {
@@ -136,6 +152,7 @@ async function runMigration() {
             'loyalty_transactions',
             'loyalty_balances',
             'integrations',
+            'registered_verticals',
             'schema_migrations',
         ];
 

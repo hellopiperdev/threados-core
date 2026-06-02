@@ -162,7 +162,7 @@ $$ LANGUAGE plpgsql;
 -- vertical module's responsibility. Core only knows: tenants are isolated,
 -- their data does not cross-contaminate.
 -- ----------------------------------------------------------------------------
-CREATE TABLE tenants (
+CREATE TABLE IF NOT EXISTS tenants (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     
     -- Human-readable identifier for ops/debugging (NOT shown to end users)
@@ -212,7 +212,7 @@ COMMENT ON TABLE tenants IS
 -- are populated for future AI-powered probabilistic matching. For MVP they
 -- remain NULL or use deterministic defaults.
 -- ----------------------------------------------------------------------------
-CREATE TABLE identities (
+CREATE TABLE IF NOT EXISTS identities (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     
@@ -256,13 +256,13 @@ CREATE TABLE identities (
 );
 
 -- Indexes for fast lookups (Bible: identity resolution at write time)
-CREATE INDEX identities_tenant_email ON identities (tenant_id, email_hash) 
+CREATE INDEX IF NOT EXISTS identities_tenant_email ON identities (tenant_id, email_hash) 
     WHERE email_hash IS NOT NULL AND deleted_at IS NULL;
-CREATE INDEX identities_tenant_phone ON identities (tenant_id, phone_hash) 
+CREATE INDEX IF NOT EXISTS identities_tenant_phone ON identities (tenant_id, phone_hash) 
     WHERE phone_hash IS NOT NULL AND deleted_at IS NULL;
-CREATE INDEX identities_resolution_key ON identities (tenant_id, resolution_key)
+CREATE INDEX IF NOT EXISTS identities_resolution_key ON identities (tenant_id, resolution_key)
     WHERE deleted_at IS NULL;
-CREATE INDEX identities_merged_into ON identities (merged_into_id) 
+CREATE INDEX IF NOT EXISTS identities_merged_into ON identities (merged_into_id) 
     WHERE merged_into_id IS NOT NULL;
 
 CREATE TRIGGER identities_update_timestamp
@@ -285,7 +285,7 @@ COMMENT ON TABLE identities IS
 -- Each row captures consent for a specific (identity, purpose) combination
 -- with full audit metadata.
 -- ----------------------------------------------------------------------------
-CREATE TABLE consent_records (
+CREATE TABLE IF NOT EXISTS consent_records (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     identity_id UUID NOT NULL REFERENCES identities(id) ON DELETE CASCADE,
@@ -329,8 +329,8 @@ CREATE TABLE consent_records (
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX consent_identity ON consent_records (identity_id, valid_from DESC);
-CREATE INDEX consent_tenant_identity_purpose 
+CREATE INDEX IF NOT EXISTS consent_identity ON consent_records (identity_id, valid_from DESC);
+CREATE INDEX IF NOT EXISTS consent_tenant_identity_purpose 
     ON consent_records (tenant_id, identity_id, purpose);
 
 CREATE TRIGGER consent_records_update_timestamp
@@ -354,7 +354,7 @@ COMMENT ON TABLE consent_records IS
 -- Verticals must register event types before they can send events.
 -- This is what catches "page_viewed" vs "pageViewed" typos and "Y" vs true.
 -- ----------------------------------------------------------------------------
-CREATE TABLE event_type_registry (
+CREATE TABLE IF NOT EXISTS event_type_registry (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     
@@ -386,7 +386,7 @@ CREATE TRIGGER event_type_registry_update_timestamp
 -- identification (Bible Decision 21). After 30 days they're deleted; the
 -- aggregate counters in event_aggregates (built later) preserve the analytics.
 -- ----------------------------------------------------------------------------
-CREATE TABLE events (
+CREATE TABLE IF NOT EXISTS events (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     
@@ -423,14 +423,14 @@ CREATE TABLE events (
         CHECK (retention_status IN ('standard', 'pending_identification', 'expired'))
 );
 
-CREATE INDEX events_tenant_identity_time 
+CREATE INDEX IF NOT EXISTS events_tenant_identity_time 
     ON events (tenant_id, identity_id, event_timestamp DESC) 
     WHERE identity_id IS NOT NULL;
 
-CREATE INDEX events_tenant_session 
+CREATE INDEX IF NOT EXISTS events_tenant_session 
     ON events (tenant_id, session_id, event_timestamp);
 
-CREATE INDEX events_pending_identification 
+CREATE INDEX IF NOT EXISTS events_pending_identification 
     ON events (tenant_id, received_at) 
     WHERE retention_status = 'pending_identification';
 
@@ -449,7 +449,7 @@ COMMENT ON TABLE events IS
 -- This is a denormalized projection updated by background processes. It's the
 -- "lens" that verticals query to show "Loyal Customer Level 5, John Peters."
 -- ----------------------------------------------------------------------------
-CREATE TABLE customers (
+CREATE TABLE IF NOT EXISTS customers (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     identity_id UUID NOT NULL UNIQUE REFERENCES identities(id) ON DELETE CASCADE,
@@ -475,8 +475,8 @@ CREATE TABLE customers (
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX customers_tenant_tier ON customers (tenant_id, tier);
-CREATE INDEX customers_tenant_lifecycle ON customers (tenant_id, lifecycle_stage);
+CREATE INDEX IF NOT EXISTS customers_tenant_tier ON customers (tenant_id, tier);
+CREATE INDEX IF NOT EXISTS customers_tenant_lifecycle ON customers (tenant_id, lifecycle_stage);
 
 CREATE TRIGGER customers_update_timestamp
     BEFORE UPDATE ON customers
@@ -491,7 +491,7 @@ CREATE TRIGGER customers_update_timestamp
 -- ----------------------------------------------------------------------------
 -- loyalty_transactions: The ledger of points earned and redeemed
 -- ----------------------------------------------------------------------------
-CREATE TABLE loyalty_transactions (
+CREATE TABLE IF NOT EXISTS loyalty_transactions (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     identity_id UUID NOT NULL REFERENCES identities(id) ON DELETE CASCADE,
@@ -521,7 +521,7 @@ CREATE TABLE loyalty_transactions (
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX loyalty_transactions_identity 
+CREATE INDEX IF NOT EXISTS loyalty_transactions_identity 
     ON loyalty_transactions (tenant_id, identity_id, occurred_at DESC);
 
 
@@ -531,7 +531,7 @@ CREATE INDEX loyalty_transactions_identity
 -- Updated as transactions are added. Reading current balance is a single
 -- row lookup instead of a sum across millions of transactions.
 -- ----------------------------------------------------------------------------
-CREATE TABLE loyalty_balances (
+CREATE TABLE IF NOT EXISTS loyalty_balances (
     tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     identity_id UUID NOT NULL REFERENCES identities(id) ON DELETE CASCADE,
     
@@ -563,7 +563,7 @@ CREATE TRIGGER loyalty_balances_update_timestamp
 -- which integrations are configured for which tenants, and stores
 -- encrypted credentials.
 -- ----------------------------------------------------------------------------
-CREATE TABLE integrations (
+CREATE TABLE IF NOT EXISTS integrations (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     
@@ -588,7 +588,7 @@ CREATE TABLE integrations (
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX integrations_tenant ON integrations (tenant_id, is_active);
+CREATE INDEX IF NOT EXISTS integrations_tenant ON integrations (tenant_id, is_active);
 
 CREATE TRIGGER integrations_update_timestamp
     BEFORE UPDATE ON integrations

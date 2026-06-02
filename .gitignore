@@ -54,8 +54,6 @@ temp/
 postgres-data/
 
 # Cloud credentials - NEVER commit these
-*.pem
-*.key
 *.crt
 *.cert
 service-account*.json
@@ -69,3 +67,8 @@ __pycache__/
 venv/
 env/
 .venv/
+
+# Cryptographic keys - NEVER commit
+keys/
+*.pem
+*.key
