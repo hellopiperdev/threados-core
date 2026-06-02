@@ -274,7 +274,7 @@ async function runTests() {
 
     testThrows('hashPII throws when salt is missing',
         () => hashPII('test'),
-        'PII_HASH_SALT environment variable is not set');
+        'Required environment variable PII_HASH_SALT is not set');
 
     // Restore salt for clean state
     process.env.PII_HASH_SALT = originalSalt;

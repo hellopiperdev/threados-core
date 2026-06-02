@@ -18,37 +18,20 @@ const crypto = require('crypto');
 // Salt resolution
 // ----------------------------------------------------------------------------
 //
-// The HMAC salt must be configured before any hashing happens. We resolve it
-// lazily (on first hash) rather than at module load, so that test setups can
-// override the salt before calling these functions.
-//
-// We also cache the resolved salt to avoid repeatedly checking process.env.
+// Delegated to the secrets module so the source of the salt (env var in dev,
+// Secret Manager in production) can change without touching hashing logic.
 // ----------------------------------------------------------------------------
 
-let _cachedSalt = null;
+const { getPiiHashSalt, _resetCacheForTesting } = require('./secrets');
 
 function getSalt() {
-    if (_cachedSalt !== null) {
-        return _cachedSalt;
-    }
-
-    const salt = process.env.PII_HASH_SALT;
-
-    if (!salt || salt.trim() === '') {
-        throw new Error(
-            'PII_HASH_SALT environment variable is not set. ' +
-            'Identity hashing cannot proceed without a configured salt.'
-        );
-    }
-
-    _cachedSalt = salt;
-    return salt;
+    return getPiiHashSalt();
 }
 
-// Test helper: reset the cached salt so tests can change it between cases.
-// Not exposed in normal usage.
+// Test helper: kept for backward compatibility with existing tests.
+// Resets the cached secrets so tests can change the salt between cases.
 function _resetSaltCache() {
-    _cachedSalt = null;
+    _resetCacheForTesting();
 }
 
 // ----------------------------------------------------------------------------

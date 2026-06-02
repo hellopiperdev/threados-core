@@ -15,6 +15,7 @@
 // ============================================================================
 
 const { Pool } = require('pg');
+const { getDatabaseConfig } = require('./secrets');
 
 // ----------------------------------------------------------------------------
 // Pool configuration
@@ -31,12 +32,10 @@ function getPool() {
         return _pool;
     }
 
+    const dbConfig = getDatabaseConfig();
+
     _pool = new Pool({
-        host: process.env.DB_HOST,
-        port: parseInt(process.env.DB_PORT, 10),
-        database: process.env.DB_NAME,
-        user: process.env.DB_USER,
-        password: process.env.DB_PASSWORD,
+        ...dbConfig,
 
         // Pool sizing - reasonable defaults for development
         max: 20,                  // Max connections in pool
