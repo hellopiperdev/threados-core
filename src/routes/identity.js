@@ -15,44 +15,10 @@
 
 const express = require('express');
 const { resolveIdentity } = require('../lib/identity');
-const {
-    validateIdentityHashRequest,
-    validateUuid,
-} = require('../lib/validation');
+const { validateIdentityHashRequest } = require('../lib/validation');
+const { requireSignedRequest } = require('../middleware/auth');
 
 const router = express.Router();
-
-// ----------------------------------------------------------------------------
-// Tenant context middleware
-// ----------------------------------------------------------------------------
-//
-// Extracts the tenant_id from request headers and attaches it to req.tenantId.
-//
-// TODO (tracked in ClickUp - Urgent): Replace this with JWT validation.
-// The production approach is: vertical signs a JWT with tenant_id claim,
-// Core verifies signature, extracts tenant_id from verified claim.
-// Bible Decision 18. Current header-based approach is for development only
-// and is explicitly insecure for production - anyone can claim any tenant_id.
-// ----------------------------------------------------------------------------
-
-function tenantContext(req, res, next) {
-    const tenantId = req.header('X-Tenant-Id');
-
-    const validation = validateUuid(tenantId, 'X-Tenant-Id');
-
-    if (!validation.valid) {
-        return res.status(400).json({
-            error: {
-                code: 'invalid_tenant',
-                message: 'X-Tenant-Id header is required and must be a valid UUID',
-                details: [validation.error],
-            },
-        });
-    }
-
-    req.tenantId = validation.value;
-    next();
-}
 
 // ----------------------------------------------------------------------------
 // Content-Type check middleware
@@ -119,7 +85,7 @@ function requireJsonContent(req, res, next) {
 //   }
 // ----------------------------------------------------------------------------
 
-router.post('/hash', requireJsonContent, tenantContext, async (req, res, next) => {
+router.post('/hash', requireJsonContent, requireSignedRequest, async (req, res, next) => {
     try {
         // Validate request body shape
         const validation = validateIdentityHashRequest(req.body);

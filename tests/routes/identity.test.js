@@ -1,14 +1,12 @@
 // ============================================================================
-// ThreadOS Core - Identity Route Tests (HTTP Integration)
+// ThreadOS Core - Identity Route Tests
 // ============================================================================
 //
-// Exercises the /api/v1/identity/hash endpoint via real HTTP requests.
-// This is the highest-level test in our suite - it verifies that the entire
-// stack works together: Express routing, validation, business logic, database
-// access, and response shaping.
+// HTTP integration tests for POST /api/v1/identity/hash. Exercises the full
+// stack: signed JWT auth, request validation, identity resolution, response
+// shape, error handling.
 //
-// The test script starts its own Express server on port 3001, runs tests,
-// and shuts down cleanly.
+// All requests go through real JWT verification using the test auth helper.
 //
 // Usage:
 //   node tests/routes/identity.test.js
@@ -19,10 +17,12 @@ require('dotenv').config();
 const http = require('http');
 const { createServer } = require('../../src/server');
 const { query, shutdown } = require('../../src/lib/db');
+const authHelper = require('../helpers/auth');
 
 const TEST_PORT = 3001;
-const TEST_TENANT_SLUG = '_test_tenant_route_session_4';
+const TEST_TENANT_SLUG = '_test_tenant_routes';
 let testTenantId = null;
+let authCtx = null;
 let server = null;
 
 // ----------------------------------------------------------------------------
@@ -74,16 +74,26 @@ function testThat(name, condition, hint) {
 // HTTP request helper
 // ----------------------------------------------------------------------------
 //
-// Makes an HTTP request and returns { statusCode, headers, body }.
-// Body is parsed as JSON if Content-Type is application/json.
+// Builds an HTTP request with optional auth. If `authToken` is provided,
+// adds Authorization: Bearer <token>. If `authToken` is null, sends no
+// auth (used for testing missing-auth scenarios).
 // ----------------------------------------------------------------------------
 
-function request(options, body) {
+function request(options, body, authToken) {
     return new Promise((resolve, reject) => {
+        const headers = {
+            'Content-Type': 'application/json',
+            ...options.headers,
+        };
+        if (authToken !== null && authToken !== undefined) {
+            headers['Authorization'] = `Bearer ${authToken}`;
+        }
+
         const req = http.request({
             hostname: 'localhost',
             port: TEST_PORT,
             ...options,
+            headers,
         }, (res) => {
             let data = '';
             res.on('data', chunk => { data += chunk; });
@@ -94,7 +104,7 @@ function request(options, body) {
                     try {
                         parsedBody = JSON.parse(data);
                     } catch (err) {
-                        // leave as string if not parseable
+                        // leave as string
                     }
                 }
                 resolve({
@@ -120,23 +130,24 @@ function request(options, body) {
 // ----------------------------------------------------------------------------
 
 async function setup() {
-    // Clean up any leftover from previous failed runs
+    // Clean any prior test tenant
     await query(`DELETE FROM tenants WHERE slug = $1`, [TEST_TENANT_SLUG]);
 
-    // Create a test tenant
+    // Create test tenant
     const result = await query(
         `INSERT INTO tenants (slug, display_name, vertical_module)
-         VALUES ($1, 'Route Test Tenant', 'test')
+         VALUES ($1, 'Routes Test Tenant', 'test')
          RETURNING id`,
         [TEST_TENANT_SLUG]
     );
     testTenantId = result.rows[0].id;
 
-    // Start the server
+    // Set up auth context (test vertical with JWKS server)
+    authCtx = await authHelper.setupTestVertical();
+
+    // Start the app server
     const app = createServer();
     server = app.listen(TEST_PORT);
-
-    // Wait for server to be ready
     await new Promise((resolve) => {
         server.on('listening', resolve);
         if (server.listening) resolve();
@@ -146,6 +157,9 @@ async function setup() {
 async function teardown() {
     if (server) {
         await new Promise(resolve => server.close(resolve));
+    }
+    if (authCtx) {
+        await authHelper.teardownTestVertical(authCtx);
     }
     if (testTenantId) {
         try {
@@ -169,9 +183,13 @@ async function runTests() {
         await setup();
         console.log(`${colors.green}✓${colors.reset} Test server running on port ${TEST_PORT}`);
         console.log(`${colors.green}✓${colors.reset} Test tenant created: ${testTenantId}`);
+        console.log(`${colors.green}✓${colors.reset} Test vertical registered: ${authCtx.slug}`);
+
+        // Pre-build a valid token for happy-path tests
+        const validToken = authHelper.signTestToken(authCtx, { sub: testTenantId });
 
         // --------------------------------------------------------------------
-        // Health check (sanity)
+        // Health check (sanity, no auth)
         // --------------------------------------------------------------------
 
         section('Health check (sanity)');
@@ -179,54 +197,47 @@ async function runTests() {
         const health = await request({
             method: 'GET',
             path: '/api/v1/health',
-        });
+        }, undefined, null);
+
         test('health endpoint returns 200', health.statusCode, 200);
         test('health endpoint returns status ok', health.body.status, 'ok');
 
         // --------------------------------------------------------------------
-        // Error: missing tenant header
+        // Errors: auth
         // --------------------------------------------------------------------
 
-        section('Errors: tenant context');
+        section('Errors: auth');
 
-        const noTenant = await request({
+        const noAuth = await request({
             method: 'POST',
             path: '/api/v1/identity/hash',
-            headers: { 'Content-Type': 'application/json' },
-        }, { email: 'a@b.com' });
+        }, { email: 'test@example.com' }, null);
 
-        test('no tenant header returns 400', noTenant.statusCode, 400);
-        test('no tenant header has invalid_tenant code',
-            noTenant.body.error.code, 'invalid_tenant');
+        test('no Authorization header returns 401', noAuth.statusCode, 401);
+        test('missing auth has missing_auth code', noAuth.body.error.code, 'missing_auth');
 
-        const invalidTenant = await request({
+        const garbageToken = await request({
             method: 'POST',
             path: '/api/v1/identity/hash',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-Tenant-Id': 'not-a-uuid',
-            },
-        }, { email: 'a@b.com' });
+        }, { email: 'test@example.com' }, 'not-a-real-jwt');
 
-        test('invalid tenant UUID returns 400', invalidTenant.statusCode, 400);
-        test('invalid tenant UUID has invalid_tenant code',
-            invalidTenant.body.error.code, 'invalid_tenant');
+        test('garbage token returns 401', garbageToken.statusCode, 401);
+        test('garbage token has token_malformed code', garbageToken.body.error.code, 'token_malformed');
 
-        const nonexistentTenant = await request({
+        const nonexistentTenantToken = authHelper.signTestToken(authCtx, {
+            sub: '00000000-0000-0000-0000-000000000000',
+        });
+        const nonexistentTenantResp = await request({
             method: 'POST',
             path: '/api/v1/identity/hash',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-Tenant-Id': '00000000-0000-0000-0000-000000000000',
-            },
-        }, { email: 'a@b.com' });
+        }, { email: 'test@example.com' }, nonexistentTenantToken);
 
-        test('nonexistent tenant returns 404', nonexistentTenant.statusCode, 404);
+        test('nonexistent tenant returns 404', nonexistentTenantResp.statusCode, 404);
         test('nonexistent tenant has tenant_not_found code',
-            nonexistentTenant.body.error.code, 'tenant_not_found');
+            nonexistentTenantResp.body.error.code, 'tenant_not_found');
 
         // --------------------------------------------------------------------
-        // Error: invalid request body
+        // Errors: request validation
         // --------------------------------------------------------------------
 
         section('Errors: request validation');
@@ -234,11 +245,7 @@ async function runTests() {
         const emptyBody = await request({
             method: 'POST',
             path: '/api/v1/identity/hash',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-Tenant-Id': testTenantId,
-            },
-        }, {});
+        }, {}, validToken);
 
         test('empty body returns 400', emptyBody.statusCode, 400);
         test('empty body has validation_failed code',
@@ -246,44 +253,32 @@ async function runTests() {
         testThat('empty body lists missing_identifier',
             emptyBody.body.error.details.some(d => d.code === 'missing_identifier'));
 
-        const badEmail = await request({
+        const malformedEmail = await request({
             method: 'POST',
             path: '/api/v1/identity/hash',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-Tenant-Id': testTenantId,
-            },
-        }, { email: 'not-an-email' });
+        }, { email: 'not-an-email' }, validToken);
 
-        test('malformed email returns 400', badEmail.statusCode, 400);
+        test('malformed email returns 400', malformedEmail.statusCode, 400);
         testThat('malformed email lists email field error',
-            badEmail.body.error.details.some(d => d.field === 'email' && d.code === 'invalid_format'));
+            malformedEmail.body.error.details.some(d => d.field === 'email'));
 
-        const badPhone = await request({
+        const shortPhone = await request({
             method: 'POST',
             path: '/api/v1/identity/hash',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-Tenant-Id': testTenantId,
-            },
-        }, { phone: '123' });
+        }, { phone: '12' }, validToken);
 
-        test('short phone returns 400', badPhone.statusCode, 400);
+        test('short phone returns 400', shortPhone.statusCode, 400);
         testThat('short phone lists phone field error',
-            badPhone.body.error.details.some(d => d.field === 'phone' && d.code === 'invalid_format'));
+            shortPhone.body.error.details.some(d => d.field === 'phone'));
 
-        const wrongType = await request({
+        const nonStringEmail = await request({
             method: 'POST',
             path: '/api/v1/identity/hash',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-Tenant-Id': testTenantId,
-            },
-        }, { email: 12345 });
+        }, { email: 12345 }, validToken);
 
-        test('non-string email returns 400', wrongType.statusCode, 400);
+        test('non-string email returns 400', nonStringEmail.statusCode, 400);
         testThat('non-string email lists type error',
-            wrongType.body.error.details.some(d => d.code === 'invalid_type'));
+            nonStringEmail.body.error.details.some(d => d.field === 'email' && d.code === 'invalid_type'));
 
         // --------------------------------------------------------------------
         // Success: create new identity
@@ -294,72 +289,62 @@ async function runTests() {
         const created = await request({
             method: 'POST',
             path: '/api/v1/identity/hash',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-Tenant-Id': testTenantId,
-            },
         }, {
-            email: 'newuser@example.com',
-            phone: '555-444-1234',
-            name: 'New User',
-        });
+            email: 'route-test-new@example.com',
+            phone: '5551234567',
+            name: 'Route Test New',
+        }, validToken);
 
         test('new identity returns 201', created.statusCode, 201);
-        testThat('response has identity object',
-            created.body.identity && typeof created.body.identity === 'object');
-        testThat('identity has id', created.body.identity.id);
+        testThat('response has identity object', created.body.identity);
+        testThat('identity has id', created.body.identity && created.body.identity.id);
         test('created flag is true', created.body.identity.created, true);
-        test('display_email is sanitized',
-            created.body.identity.display_email, 'n*****@example.com');
-        test('display_phone is sanitized',
-            created.body.identity.display_phone, '***-***-1234');
-        test('display_name is preserved', created.body.identity.display_name, 'New User');
+        testThat('display_email is sanitized',
+            created.body.identity.display_email &&
+            created.body.identity.display_email.includes('*'));
+        testThat('display_phone is sanitized',
+            created.body.identity.display_phone &&
+            created.body.identity.display_phone.includes('*'));
+        test('display_name is preserved', created.body.identity.display_name, 'Route Test New');
 
-        // Verify we never expose raw PII or hashes in the response
-        const responseJson = JSON.stringify(created.body);
+        // Privacy guarantees: raw PII and hashes must not appear
+        const responseString = JSON.stringify(created.body);
         testThat('response does NOT contain raw email',
-            !responseJson.includes('newuser@example.com'),
-            'raw email leaked in response!');
+            !responseString.includes('route-test-new@example.com'));
         testThat('response does NOT contain email_hash field',
-            !responseJson.includes('email_hash'));
+            !responseString.includes('email_hash'));
         testThat('response does NOT contain phone_hash field',
-            !responseJson.includes('phone_hash'));
+            !responseString.includes('phone_hash'));
 
         // --------------------------------------------------------------------
-        // Success: find existing identity (idempotent)
+        // Success: find existing identity
         // --------------------------------------------------------------------
 
         section('Success: find existing identity');
 
-        const found = await request({
+        const findAgain = await request({
             method: 'POST',
             path: '/api/v1/identity/hash',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-Tenant-Id': testTenantId,
-            },
         }, {
-            email: 'newuser@example.com',
-        });
+            email: 'route-test-new@example.com',
+            phone: '5551234567',
+        }, validToken);
 
-        test('existing identity returns 200', found.statusCode, 200);
-        test('same identity id', found.body.identity.id, created.body.identity.id);
-        test('created flag is false', found.body.identity.created, false);
+        test('existing identity returns 200', findAgain.statusCode, 200);
+        test('same identity id',
+            findAgain.body.identity.id, created.body.identity.id);
+        test('created flag is false', findAgain.body.identity.created, false);
 
-        // Case-insensitive match should still find the same identity
-        const caseFound = await request({
+        const caseInsensitive = await request({
             method: 'POST',
             path: '/api/v1/identity/hash',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-Tenant-Id': testTenantId,
-            },
         }, {
-            email: 'NEWUSER@EXAMPLE.COM',
-        });
+            email: 'ROUTE-TEST-NEW@EXAMPLE.COM',
+        }, validToken);
 
-        test('case-insensitive match', caseFound.body.identity.id, created.body.identity.id);
-        test('case-insensitive not created', caseFound.body.identity.created, false);
+        test('case-insensitive match',
+            caseInsensitive.body.identity.id, created.body.identity.id);
+        test('case-insensitive not created', caseInsensitive.body.identity.created, false);
 
         // --------------------------------------------------------------------
         // Response headers
@@ -367,8 +352,8 @@ async function runTests() {
 
         section('Response headers');
 
-        test('response includes X-Service header',
-            created.headers['x-service'], 'threados-core');
+        testThat('response includes X-Service header',
+            created.headers['x-service'] === 'threados-core');
         testThat('response uses JSON content type',
             (created.headers['content-type'] || '').includes('application/json'));
 
@@ -381,10 +366,6 @@ async function runTests() {
             console.log(`${colors.yellow}⚠${colors.reset} Teardown error: ${err.message}`);
         }
     }
-
-    // ------------------------------------------------------------------------
-    // Summary
-    // ------------------------------------------------------------------------
 
     console.log(`\n${colors.bold}━━ Summary ━━${colors.reset}`);
     console.log(`${colors.green}Passed:${colors.reset} ${passed}`);

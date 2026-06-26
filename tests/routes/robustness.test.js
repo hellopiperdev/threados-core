@@ -2,17 +2,10 @@
 // ThreadOS Core - Robustness Tests
 // ============================================================================
 //
-// Tests edge cases discovered during manual exploration in Session 5 of
-// Step 4. These verify that the endpoint behaves correctly under unusual
-// or malicious-looking inputs that aren't part of the happy path.
-//
-// Covered:
-//   - Malformed JSON returns 400 (not 500)
-//   - Oversized payloads return 413 (not 500)
-//   - Wrong Content-Type returns 415 with actionable error
-//   - Null bytes in name return 400 (caught at validation, not at DB)
-//   - SQL injection attempts are stored as data, never executed
-//   - X-Powered-By header is not exposed
+// Tests edge cases for the /api/v1/identity/hash endpoint. All requests use
+// real JWT auth via the test helper. Covers behaviors the basic route tests
+// don't: malformed JSON, oversized payloads, wrong Content-Type, control
+// characters in input, SQL injection attempts, and information disclosure.
 //
 // Usage:
 //   node tests/routes/robustness.test.js
@@ -23,14 +16,17 @@ require('dotenv').config();
 const http = require('http');
 const { createServer } = require('../../src/server');
 const { query, shutdown } = require('../../src/lib/db');
+const authHelper = require('../helpers/auth');
 
 const TEST_PORT = 3002;
 const TEST_TENANT_SLUG = '_test_tenant_robustness';
 let testTenantId = null;
+let authCtx = null;
 let server = null;
+let validToken = null;
 
 // ----------------------------------------------------------------------------
-// Test runner state (same pattern as other test files)
+// Test runner state
 // ----------------------------------------------------------------------------
 
 let passed = 0;
@@ -75,8 +71,7 @@ function testThat(name, condition, hint) {
 }
 
 // ----------------------------------------------------------------------------
-// HTTP helper - more flexible than the standard one since we need to send
-// raw bodies (malformed JSON) and custom content types
+// HTTP helper that accepts raw bodies and custom headers
 // ----------------------------------------------------------------------------
 
 function request(options, body) {
@@ -117,7 +112,7 @@ function request(options, body) {
 }
 
 // ----------------------------------------------------------------------------
-// Setup and teardown
+// Setup / teardown
 // ----------------------------------------------------------------------------
 
 async function setup() {
@@ -131,9 +126,11 @@ async function setup() {
     );
     testTenantId = result.rows[0].id;
 
+    authCtx = await authHelper.setupTestVertical();
+    validToken = authHelper.signTestToken(authCtx, { sub: testTenantId });
+
     const app = createServer();
     server = app.listen(TEST_PORT);
-
     await new Promise((resolve) => {
         server.on('listening', resolve);
         if (server.listening) resolve();
@@ -143,6 +140,9 @@ async function setup() {
 async function teardown() {
     if (server) {
         await new Promise(resolve => server.close(resolve));
+    }
+    if (authCtx) {
+        await authHelper.teardownTestVertical(authCtx);
     }
     if (testTenantId) {
         try {
@@ -166,10 +166,12 @@ async function runTests() {
         await setup();
         console.log(`${colors.green}✓${colors.reset} Test server running on port ${TEST_PORT}`);
         console.log(`${colors.green}✓${colors.reset} Test tenant: ${testTenantId}`);
+        console.log(`${colors.green}✓${colors.reset} Test vertical: ${authCtx.slug}`);
 
-        const headers = {
+        // Pre-build authed headers for tests that need a normal request
+        const authedHeaders = {
             'Content-Type': 'application/json',
-            'X-Tenant-Id': testTenantId,
+            'Authorization': `Bearer ${validToken}`,
         };
 
         // --------------------------------------------------------------------
@@ -181,7 +183,7 @@ async function runTests() {
         const normalResponse = await request({
             method: 'POST',
             path: '/api/v1/identity/hash',
-            headers,
+            headers: authedHeaders,
         }, { email: 'header-test@example.com' });
 
         testThat('X-Powered-By header is NOT exposed',
@@ -197,7 +199,7 @@ async function runTests() {
         const badJson = await request({
             method: 'POST',
             path: '/api/v1/identity/hash',
-            headers,
+            headers: authedHeaders,
         }, '{not valid json');
 
         test('malformed JSON returns 400 (not 500)', badJson.statusCode, 400);
@@ -207,7 +209,7 @@ async function runTests() {
         const truncatedJson = await request({
             method: 'POST',
             path: '/api/v1/identity/hash',
-            headers,
+            headers: authedHeaders,
         }, '{"email":"test@example.com"');
 
         test('truncated JSON returns 400', truncatedJson.statusCode, 400);
@@ -220,14 +222,13 @@ async function runTests() {
 
         section('Oversized payload');
 
-        // Build a 200KB body (server limit is 100KB)
         const hugeName = 'A'.repeat(200000);
         const hugePayload = JSON.stringify({ email: 'big@example.com', name: hugeName });
 
         const oversized = await request({
             method: 'POST',
             path: '/api/v1/identity/hash',
-            headers,
+            headers: authedHeaders,
         }, hugePayload);
 
         test('oversized payload returns 413', oversized.statusCode, 413);
@@ -243,7 +244,7 @@ async function runTests() {
         const noContentType = await request({
             method: 'POST',
             path: '/api/v1/identity/hash',
-            headers: { 'X-Tenant-Id': testTenantId },
+            headers: { 'Authorization': `Bearer ${validToken}` },
         }, { email: 'test@example.com' });
 
         test('missing Content-Type returns 415', noContentType.statusCode, 415);
@@ -255,7 +256,7 @@ async function runTests() {
             path: '/api/v1/identity/hash',
             headers: {
                 'Content-Type': 'text/plain',
-                'X-Tenant-Id': testTenantId,
+                'Authorization': `Bearer ${validToken}`,
             },
         }, 'not json');
 
@@ -270,7 +271,7 @@ async function runTests() {
         const nullByte = await request({
             method: 'POST',
             path: '/api/v1/identity/hash',
-            headers,
+            headers: authedHeaders,
         }, { email: 'nullbyte@example.com', name: 'Alice\u0000Hidden' });
 
         test('null byte in name returns 400', nullByte.statusCode, 400);
@@ -283,16 +284,15 @@ async function runTests() {
         const verticalTab = await request({
             method: 'POST',
             path: '/api/v1/identity/hash',
-            headers,
+            headers: authedHeaders,
         }, { email: 'vtab@example.com', name: 'Alice\u000BHidden' });
 
         test('vertical tab in name returns 400', verticalTab.statusCode, 400);
 
-        // Verify legitimate special characters still work
         const unicode = await request({
             method: 'POST',
             path: '/api/v1/identity/hash',
-            headers,
+            headers: authedHeaders,
         }, { email: 'unicode-robust@example.com', name: 'María José 🌟 李明' });
 
         test('valid unicode in name returns 201', unicode.statusCode, 201);
@@ -308,7 +308,7 @@ async function runTests() {
         const injectionInName = await request({
             method: 'POST',
             path: '/api/v1/identity/hash',
-            headers,
+            headers: authedHeaders,
         }, {
             email: 'sqli-test@example.com',
             name: "Robert'); DROP TABLE identities; --",
@@ -320,7 +320,6 @@ async function runTests() {
             injectionInName.body.identity.display_name,
             "Robert'); DROP TABLE identities; --");
 
-        // Verify the identities table still exists
         const tableCheck = await query(
             `SELECT count(*) AS count FROM identities WHERE tenant_id = $1`,
             [testTenantId]
@@ -331,7 +330,7 @@ async function runTests() {
         const injectionInEmail = await request({
             method: 'POST',
             path: '/api/v1/identity/hash',
-            headers,
+            headers: authedHeaders,
         }, { email: "alice@example.com'; DROP TABLE identities; --" });
 
         test('SQL injection in email is rejected by validation',
@@ -349,10 +348,6 @@ async function runTests() {
             console.log(`${colors.yellow}⚠${colors.reset} Teardown error: ${err.message}`);
         }
     }
-
-    // ------------------------------------------------------------------------
-    // Summary
-    // ------------------------------------------------------------------------
 
     console.log(`\n${colors.bold}━━ Summary ━━${colors.reset}`);
     console.log(`${colors.green}Passed:${colors.reset} ${passed}`);
