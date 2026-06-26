@@ -67,3 +67,44 @@ COMMENT ON TABLE registered_verticals IS
 INSERT INTO schema_migrations (version, description)
 VALUES ('002_registered_verticals', 'Add registered_verticals table for JWT vertical registration')
 ON CONFLICT (version) DO NOTHING;
+
+
+-- ============================================================================
+-- Migration 003: Event Capture Support
+-- ============================================================================
+--
+-- Prepares the events table for the Step 6 event capture API.
+--
+--   - event_id: client-provided idempotency key. Bible Decision 8 distinguishes
+--     client-supplied identifiers from Core-generated ones, so this is a
+--     separate column from the Core-generated `id` primary key. Submitting the
+--     same (tenant_id, event_id) twice is a no-op success.
+--
+--   - device_fingerprint: optional anonymous identifier. An event must carry at
+--     least one of identity_id, session_id, or device_fingerprint. This is a
+--     label captured with the event (Bible Decision 20: device context is for
+--     aggregate analytics, NOT cross-session identification of anonymous users).
+--
+--   - session_id made nullable: the base schema declared it NOT NULL, but an
+--     anonymous event may be keyed on device_fingerprint alone, so session_id
+--     is no longer universally required.
+--
+-- Bible references:
+--   Decision 8: Event schema structure (client vs Core-generated fields)
+--   Decision 20: Cookieless-first; device context is a label, not a tracker
+-- ============================================================================
+
+ALTER TABLE events ADD COLUMN IF NOT EXISTS event_id UUID;
+ALTER TABLE events ADD COLUMN IF NOT EXISTS device_fingerprint VARCHAR(200);
+ALTER TABLE events ALTER COLUMN session_id DROP NOT NULL;
+
+-- Idempotency: a given client event_id may be submitted at most once per tenant.
+-- The partial predicate (WHERE event_id IS NOT NULL) leaves any legacy rows
+-- without an event_id untouched while enforcing uniqueness for all new events.
+CREATE UNIQUE INDEX IF NOT EXISTS events_tenant_event_id
+    ON events (tenant_id, event_id)
+    WHERE event_id IS NOT NULL;
+
+INSERT INTO schema_migrations (version, description)
+VALUES ('003_event_capture', 'Add event_id idempotency key + device_fingerprint, make session_id nullable for event capture')
+ON CONFLICT (version) DO NOTHING;

@@ -187,6 +187,7 @@ CREATE TABLE IF NOT EXISTS tenants (
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+DROP TRIGGER IF EXISTS tenants_update_timestamp ON tenants;
 CREATE TRIGGER tenants_update_timestamp
     BEFORE UPDATE ON tenants
     FOR EACH ROW EXECUTE FUNCTION update_updated_at();
@@ -265,6 +266,7 @@ CREATE INDEX IF NOT EXISTS identities_resolution_key ON identities (tenant_id, r
 CREATE INDEX IF NOT EXISTS identities_merged_into ON identities (merged_into_id) 
     WHERE merged_into_id IS NOT NULL;
 
+DROP TRIGGER IF EXISTS identities_update_timestamp ON identities;
 CREATE TRIGGER identities_update_timestamp
     BEFORE UPDATE ON identities
     FOR EACH ROW EXECUTE FUNCTION update_updated_at();
@@ -333,6 +335,7 @@ CREATE INDEX IF NOT EXISTS consent_identity ON consent_records (identity_id, val
 CREATE INDEX IF NOT EXISTS consent_tenant_identity_purpose 
     ON consent_records (tenant_id, identity_id, purpose);
 
+DROP TRIGGER IF EXISTS consent_records_update_timestamp ON consent_records;
 CREATE TRIGGER consent_records_update_timestamp
     BEFORE UPDATE ON consent_records
     FOR EACH ROW EXECUTE FUNCTION update_updated_at();
@@ -374,6 +377,7 @@ CREATE TABLE IF NOT EXISTS event_type_registry (
     UNIQUE (tenant_id, event_name)
 );
 
+DROP TRIGGER IF EXISTS event_type_registry_update_timestamp ON event_type_registry;
 CREATE TRIGGER event_type_registry_update_timestamp
     BEFORE UPDATE ON event_type_registry
     FOR EACH ROW EXECUTE FUNCTION update_updated_at();
@@ -478,6 +482,7 @@ CREATE TABLE IF NOT EXISTS customers (
 CREATE INDEX IF NOT EXISTS customers_tenant_tier ON customers (tenant_id, tier);
 CREATE INDEX IF NOT EXISTS customers_tenant_lifecycle ON customers (tenant_id, lifecycle_stage);
 
+DROP TRIGGER IF EXISTS customers_update_timestamp ON customers;
 CREATE TRIGGER customers_update_timestamp
     BEFORE UPDATE ON customers
     FOR EACH ROW EXECUTE FUNCTION update_updated_at();
@@ -546,6 +551,7 @@ CREATE TABLE IF NOT EXISTS loyalty_balances (
     PRIMARY KEY (tenant_id, identity_id)
 );
 
+DROP TRIGGER IF EXISTS loyalty_balances_update_timestamp ON loyalty_balances;
 CREATE TRIGGER loyalty_balances_update_timestamp
     BEFORE UPDATE ON loyalty_balances
     FOR EACH ROW EXECUTE FUNCTION update_updated_at();
@@ -590,6 +596,7 @@ CREATE TABLE IF NOT EXISTS integrations (
 
 CREATE INDEX IF NOT EXISTS integrations_tenant ON integrations (tenant_id, is_active);
 
+DROP TRIGGER IF EXISTS integrations_update_timestamp ON integrations;
 CREATE TRIGGER integrations_update_timestamp
     BEFORE UPDATE ON integrations
     FOR EACH ROW EXECUTE FUNCTION update_updated_at();

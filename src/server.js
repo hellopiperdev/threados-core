@@ -9,6 +9,7 @@
 
 const express = require('express');
 const identityRoutes = require('./routes/identity');
+const eventRoutes = require('./routes/events');
 const wellKnownRoutes = require('./routes/wellKnown');
 
 function createServer() {
@@ -69,6 +70,12 @@ function createServer() {
     // ------------------------------------------------------------------------
     
     app.use('/api/v1/identity', identityRoutes);
+
+    // ------------------------------------------------------------------------
+    // Event routes
+    // ------------------------------------------------------------------------
+
+    app.use('/api/v1/events', eventRoutes);
 
     // ------------------------------------------------------------------------
     // JSON parse error handler
