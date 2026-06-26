@@ -187,14 +187,14 @@ The connection pool is configured in `db.js` and gets its config from `secrets.j
 Phase A: COMPLETE (Steps 1-4)
 Phase B in progress:
   [✓] Step 5: JWT authentication (5 sessions + prerequisite, complete)
-  [ ] Step 6: Event capture API (next)
+  [~] Step 6: Event capture API (Session 1 complete; robustness + docs sessions remain)
   [ ] Step 7: Consent management
   [ ] Step 8: Audit logging pipeline
   [ ] Step 9: Loyalty wallet
   [ ] Step 10: Production deployment to GCP
 ```
 
-Total tests passing: 291. Latest commit on `main` at time of writing: `7955e5b`.
+Total tests passing: 402. Latest commit on `main` at time of writing: `1f696d2`.
 
 The Step 6 design is settled (event capture endpoint with batch support, reject-all on validation failure, sync persistence, regex-based PII detection, identity/session/device linkage, idempotency via client-provided event_id). Sessions will be planned in the chat interface and executed here.
 
