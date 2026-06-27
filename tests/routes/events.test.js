@@ -296,6 +296,24 @@ async function runTests() {
             !JSON.stringify(piiEmail.body).includes('jane@example.com'),
             'error response must not leak the raw PII it rejected');
 
+        // PII smuggled into a property KEY must be rejected too (Gap 1). A bare
+        // {"jane@example.com": "clicked"} previously passed and persisted the email.
+        const piiKey = await request({ method: 'POST', path: PATH },
+            makeEvent({ properties: { 'jane@example.com': 'clicked' } }), validToken);
+        test('PII in a property key returns 400', piiKey.statusCode, 400);
+        testThat('PII key flagged as pii_detected',
+            piiKey.body.error.details.some(d => d.code === 'pii_detected'));
+        testThat('PII key text is NOT echoed back in the error',
+            !JSON.stringify(piiKey.body).includes('jane@example.com'),
+            'error response must not leak the raw PII key it rejected');
+
+        // International phone numbers must be caught, not just US formats (Gap 2).
+        const piiIntlPhone = await request({ method: 'POST', path: PATH },
+            makeEvent({ properties: { note: '+44 20 7946 0958' } }), validToken);
+        test('international phone in properties returns 400', piiIntlPhone.statusCode, 400);
+        testThat('international phone flagged as pii_detected',
+            piiIntlPhone.body.error.details.some(d => d.code === 'pii_detected'));
+
         // --------------------------------------------------------------------
         section('Errors: unregistered event (Decision 8)');
         // --------------------------------------------------------------------

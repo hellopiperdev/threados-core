@@ -84,6 +84,37 @@ const PII_PATTERNS = [
         //   no match:   5551234567     123456789012     12025551234 (unseparated)
         regex: /(?:\+?1[-.\s]?)?(?:\(\d{3}\)[-.\s]?|\d{3}[-.\s])\d{3}[-.\s]\d{4}/,
     },
+    {
+        type: 'phone',
+        // International phone numbers in (loose) E.164 presentation: a leading +,
+        // a 1-3 digit country code, then the national number written as digit
+        // groups separated by spaces, dashes, or dots. The US/NANP pattern above
+        // is formatting-specific and misses these entirely.
+        //   matches:  +44 20 7946 0958 (UK)   +86 138 0000 0000 (China)
+        //             +49 30 12345678 (Germany)   +1 555.123.4567
+        //   no match: +1 (bare CC)   order+12 34 (too few national digits)
+        //
+        // Narrowing (yesterday's under-detect-over-over-detect bias): we REQUIRE a
+        // separator immediately after the country code, then 7-14 national digits.
+        // That keeps a bare "+1", or a + sitting next to a short number, from
+        // tripping it, while still catching the grouped international formats we
+        // verified slip through. Unseparated runs are handled by the pattern below.
+        regex: /\+\d{1,3}[-.\s]\d(?:[-.\s]?\d){6,13}/,
+    },
+    {
+        type: 'phone',
+        // Unseparated international E.164: a leading + and 8-15 digits with no
+        // separators at all (e.g. +442079460958, +8613800000000). Yesterday's
+        // under-detect bias was specifically about bare digit runs WITHOUT a
+        // leading + - order numbers and ids, where false positives are a real
+        // risk. Once a + prefix is present, 8+ digits is either a phone number or
+        // something genuinely weird, so the over-detection risk is narrow enough
+        // to catch it. The 8-digit floor keeps "+1" and "+12345" (too short for
+        // any real number) from tripping it.
+        //   matches:  +442079460958 (UK)   +8613800000000 (China)
+        //   no match: +1   +12345 (too short)
+        regex: /\+\d{8,15}/,
+    },
 ];
 
 // Detect PII in a single scalar value. Returns the matched pattern type, or
@@ -113,9 +144,24 @@ function scanForPii(value, path = 'properties') {
             findings.push(...scanForPii(item, `${path}[${i}]`));
         });
     } else if (value !== null && typeof value === 'object') {
-        for (const [key, child] of Object.entries(value)) {
-            findings.push(...scanForPii(child, `${path}.${key}`));
-        }
+        Object.entries(value).forEach(([key, child], i) => {
+            // Scan the KEY itself, not just its value. A property *name* can carry
+            // PII too - e.g. {"jane@example.com": "clicked"} would otherwise sail
+            // through (we only recursed into values) and persist the raw email in
+            // the JSONB column, a Bible Decision 10 violation. We report the key by
+            // position, never by its text, so the error never echoes the PII - the
+            // same rule we apply to values.
+            const keyType = detectPiiInScalar(key);
+            if (keyType) {
+                findings.push({ path: `${path}[key#${i}]`, type: keyType });
+            }
+            // When the key itself is PII we must not propagate it into the child's
+            // path either, or a nested value finding would re-leak it in the error
+            // message; fall back to the positional form. Otherwise use the readable
+            // dotted path.
+            const childPath = keyType ? `${path}[key#${i}].value` : `${path}.${key}`;
+            findings.push(...scanForPii(child, childPath));
+        });
     } else {
         const type = detectPiiInScalar(value);
         if (type) {

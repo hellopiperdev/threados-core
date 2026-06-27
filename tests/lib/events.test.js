@@ -169,6 +169,22 @@ async function runTests() {
         test('detects formatted phone in scalar', detectPiiInScalar('555-123-4567'), 'phone');
         test('detects phone with +1 country code', detectPiiInScalar('+1 (555) 123-4567'), 'phone');
         test('detects parenthesized area code', detectPiiInScalar('(555) 123-4567'), 'phone');
+
+        // International phone formats (Gap 2). These all slipped through the
+        // US-only regex; the new international pattern catches the +CC grouping.
+        test('detects UK international phone', detectPiiInScalar('+44 20 7946 0958'), 'phone');
+        test('detects China international phone', detectPiiInScalar('+86 138 0000 0000'), 'phone');
+        test('detects Germany international phone', detectPiiInScalar('+49 30 12345678'), 'phone');
+        // Unseparated E.164: a + prefix plus 8-15 digits, no separators. Once a +
+        // is present, a long digit run is a phone, not an order number.
+        test('detects UK unseparated E.164', detectPiiInScalar('+442079460958'), 'phone');
+        test('detects China unseparated E.164', detectPiiInScalar('+8613800000000'), 'phone');
+        // Under-detection guard: the international patterns must not fire on a bare
+        // country code, a +-prefixed run too short to be a real number, or a + that
+        // sits next to a short separated group.
+        test('bare +1 is NOT flagged', detectPiiInScalar('+1'), null);
+        test('+12345 is too short to be flagged', detectPiiInScalar('+12345'), null);
+        test('plus-tagged short token is NOT flagged', detectPiiInScalar('order+12 34'), null);
         // Narrowing: a bare run of 10 digits is NOT treated as a phone (could be
         // an order number / id). We under-detect on purpose.
         test('bare 10-digit number is NOT flagged as phone', detectPiiInScalar('5551234567'), null);
@@ -194,6 +210,33 @@ async function runTests() {
         test('bare numeric value is not flagged', bareNumericValue.length, 0);
 
         test('clean properties yields no findings', scanForPii({ a: 1, b: 'x', c: true }).length, 0);
+
+        // PII in object KEYS, not just values (Gap 1). {"jane@example.com": "x"}
+        // would previously persist the email; now the key itself is scanned.
+        const emailKey = scanForPii({ 'jane@example.com': 'clicked' });
+        testThat('email in an object key is flagged',
+            emailKey.some(f => f.type === 'email'));
+        testThat('key finding path marks it as a key (distinct from a value path)',
+            emailKey.some(f => f.type === 'email' && f.path.includes('[key#')));
+        testThat('the PII key text is NOT echoed in the finding path',
+            !emailKey.some(f => f.path.includes('jane@example.com')));
+
+        const phoneKey = scanForPii({ '+44 20 7946 0958': 'ok' });
+        testThat('international phone in an object key is flagged',
+            phoneKey.some(f => f.type === 'phone'));
+
+        const nestedKey = scanForPii({ contact: { 'a@b.co': 'x' } });
+        testThat('PII in a nested key is flagged at the nested path',
+            nestedKey.some(f => f.type === 'email' && f.path.startsWith('properties.contact[key#')));
+
+        // A clean key whose VALUE is PII is still reported as a value finding (no
+        // [key# marker) - proves the two cases stay distinguishable.
+        const valuePii = scanForPii({ note: 'reach me at 555-123-4567' });
+        testThat('PII value under a clean key is reported as a value, not a key',
+            valuePii.length === 1 && !valuePii[0].path.includes('[key#'));
+
+        // Over-detection guard for keys: an ordinary key is not flagged.
+        test('ordinary keys are not flagged', scanForPii({ user_id: 'abc', count: 3 }).length, 0);
 
         // --------------------------------------------------------------------
         section('validateEvent (Decisions 7, 8)');
