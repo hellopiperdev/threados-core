@@ -396,9 +396,15 @@ function validateEventsRequest(body) {
     } else if (body && typeof body === 'object') {
         events = [body];
     } else {
+        // The body parsed as valid JSON but its top-level type is neither an
+        // object nor an array (e.g. a bare string, number, boolean, or null).
+        // This is distinct from "not valid JSON": the bytes were fine, the shape
+        // is wrong. We surface a dedicated code so the route can say exactly that
+        // rather than mislabeling it invalid_json.
         return {
             valid: false,
-            errors: [{ field: 'body', code: 'invalid_type', message: 'request body must be an event object or an array of event objects' }],
+            code: 'invalid_body_type',
+            errors: [{ field: 'body', code: 'invalid_body_type', message: 'request body must be a JSON object or an array of objects' }],
         };
     }
 
@@ -664,7 +670,9 @@ async function captureEvents(tenantId, body) {
 
     const validation = validateEventsRequest(body);
     if (!validation.valid) {
-        return { ok: false, code: 'validation_failed', errors: validation.errors };
+        // A wrong top-level type carries its own code (invalid_body_type); every
+        // other shape failure is a generic validation_failed.
+        return { ok: false, code: validation.code || 'validation_failed', errors: validation.errors };
     }
 
     const events = validation.value;

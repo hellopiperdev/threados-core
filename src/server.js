@@ -22,16 +22,26 @@ function createServer() {
     // ------------------------------------------------------------------------
     // Global middleware
     // ------------------------------------------------------------------------
-    
-    // Parse JSON request bodies
-    app.use(express.json({ limit: '100kb' }));
-    
-    // Tag every response with a service identifier (useful for debugging
-    // when multiple services are involved)
+
+    // Tag every response with a service identifier (useful for debugging when
+    // multiple services are involved). This runs BEFORE the body parser on
+    // purpose: the parser can reject a request itself (invalid JSON, oversized
+    // payload) before any route-level middleware runs, and those error responses
+    // must carry X-Service too. Setting the header here means it's already on the
+    // response object no matter which layer ends up producing the body.
     app.use((req, res, next) => {
         res.setHeader('X-Service', 'threados-core');
         next();
     });
+
+    // Parse JSON request bodies. strict:false so the parser accepts any JSON
+    // value, including top-level primitives (a string, number, boolean, null).
+    // With the default strict:true those parse as "invalid JSON" - which is a
+    // lie, the JSON is valid, it's just the wrong top-level *type*. We'd rather
+    // accept them here and let the route reject them with an accurate
+    // invalid_body_type (see validateEventsRequest). A genuine syntax error still
+    // fails to parse and surfaces as invalid_json below.
+    app.use(express.json({ limit: '100kb', strict: false }));
 
     // ------------------------------------------------------------------------
     // Health check endpoint

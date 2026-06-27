@@ -214,6 +214,19 @@ async function runTests() {
         const garbage = await request({ method: 'POST', path: PATH }, makeEvent(), 'not-a-jwt');
         test('garbage token returns 401', garbage.statusCode, 401);
 
+        // An expired token must be rejected by the same middleware the identity
+        // route uses. The middleware has unit coverage for this; this is the
+        // events-route integration proof. (Pattern mirrors tests/middleware/auth.)
+        const nowSec = Math.floor(Date.now() / 1000);
+        const expiredToken = authHelper.signTestToken(authCtx, {
+            sub: testTenantId,
+            iat: nowSec - 7200,
+            exp: nowSec - 3600,
+        });
+        const expired = await request({ method: 'POST', path: PATH }, makeEvent(), expiredToken);
+        test('expired token returns 401', expired.statusCode, 401);
+        test('expired token has token_expired code', expired.body.error.code, 'token_expired');
+
         // --------------------------------------------------------------------
         section('Errors: content type');
         // --------------------------------------------------------------------
@@ -345,6 +358,10 @@ async function runTests() {
         test('nonexistent tenant returns 404', noTenant.statusCode, 404);
         test('nonexistent tenant has tenant_not_found code',
             noTenant.body.error.code, 'tenant_not_found');
+        // 404 is produced deep in captureEvents, well past the body parser, so it
+        // should carry X-Service like every other Core response.
+        testThat('tenant_not_found response carries X-Service header',
+            noTenant.headers['x-service'] === 'threados-core');
 
         // --------------------------------------------------------------------
         section('Success: single event');
@@ -402,6 +419,51 @@ async function runTests() {
             [testTenantId, good.event_id]
         );
         test('reject-all persisted nothing from the batch', goodPersisted.rows[0].n, 0);
+
+        // --------------------------------------------------------------------
+        section('Errors: malformed JSON and wrong body type');
+        // --------------------------------------------------------------------
+
+        // Finding #3: body-parser rejections must carry X-Service. A genuine
+        // syntax error is still invalid_json (Finding #4 must not lose this case).
+        const badJson = await request({ method: 'POST', path: PATH }, '{not valid', validToken);
+        test('malformed JSON returns 400', badJson.statusCode, 400);
+        test('malformed JSON has invalid_json code', badJson.body.error.code, 'invalid_json');
+        testThat('invalid_json response carries X-Service header (Finding #3)',
+            badJson.headers['x-service'] === 'threados-core');
+
+        // Same generality check on a different body-parser rejection: an oversized
+        // body fails inside express.json, before any route middleware runs.
+        const oversized = await request({ method: 'POST', path: PATH },
+            makeEvent({ properties: { blob: 'x'.repeat(150000) } }), validToken);
+        test('oversized body returns 413', oversized.statusCode, 413);
+        test('oversized body has payload_too_large code',
+            oversized.body.error.code, 'payload_too_large');
+        testThat('payload_too_large response carries X-Service header (Finding #3)',
+            oversized.headers['x-service'] === 'threados-core');
+
+        // Finding #4: valid JSON whose top-level type is not an object/array is
+        // NOT invalid_json - it parses fine, the shape is just wrong. Each must
+        // come back as invalid_body_type, not invalid_json.
+        const stringBody = await request({ method: 'POST', path: PATH }, '"a string"', validToken);
+        test('string body returns 400', stringBody.statusCode, 400);
+        test('string body has invalid_body_type code',
+            stringBody.body.error.code, 'invalid_body_type');
+
+        const numberBody = await request({ method: 'POST', path: PATH }, 42, validToken);
+        test('number body returns 400', numberBody.statusCode, 400);
+        test('number body has invalid_body_type code',
+            numberBody.body.error.code, 'invalid_body_type');
+
+        const nullBody = await request({ method: 'POST', path: PATH }, null, validToken);
+        test('null body returns 400', nullBody.statusCode, 400);
+        test('null body has invalid_body_type code',
+            nullBody.body.error.code, 'invalid_body_type');
+
+        const boolBody = await request({ method: 'POST', path: PATH }, true, validToken);
+        test('boolean body returns 400', boolBody.statusCode, 400);
+        test('boolean body has invalid_body_type code',
+            boolBody.body.error.code, 'invalid_body_type');
 
         // --------------------------------------------------------------------
         section('Response headers');

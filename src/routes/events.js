@@ -54,8 +54,9 @@ function requireJsonContent(req, res, next) {
 // THE STATUS RULE (deliberate, Core-wide convention - do not re-derive):
 //
 //   400  Unprocessable / malformed payload. The request body itself is wrong:
-//        missing/ill-typed fields, bad timestamp, PII in properties. The client
-//        can fix it by correcting the bytes it sent.   -> validation_failed
+//        missing/ill-typed fields, bad timestamp, PII in properties, or a body
+//        whose top-level JSON type isn't an object/array. The client can fix it
+//        by correcting the bytes it sent.   -> validation_failed, invalid_body_type
 //
 //   404  The TENANT addressed by the JWT `sub` claim does not exist. This is the
 //        single "the addressed tenant is missing" case, and it mirrors the
@@ -82,6 +83,7 @@ function statusForRejection(code) {
         case 'identity_not_found':
             return 422;
         case 'validation_failed':
+        case 'invalid_body_type':
         default:
             return 400;
     }

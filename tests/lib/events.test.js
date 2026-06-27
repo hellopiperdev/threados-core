@@ -330,9 +330,19 @@ async function runTests() {
         testThat('empty array rejected', !emptyArr.valid &&
             emptyArr.errors.some(e => e.code === 'empty_batch'));
 
+        // A valid-JSON-but-wrong-top-level-type body is rejected with a dedicated
+        // invalid_body_type code (not invalid_type / not invalid_json), so the
+        // route can tell the client the shape is wrong rather than the bytes.
         const notObj = validateEventsRequest('hello');
-        testThat('string body rejected', !notObj.valid &&
-            notObj.errors.some(e => e.code === 'invalid_type'));
+        testThat('string body rejected as invalid_body_type', !notObj.valid &&
+            notObj.code === 'invalid_body_type' &&
+            notObj.errors.some(e => e.code === 'invalid_body_type'));
+        testThat('number body rejected as invalid_body_type',
+            validateEventsRequest(42).code === 'invalid_body_type');
+        testThat('null body rejected as invalid_body_type',
+            validateEventsRequest(null).code === 'invalid_body_type');
+        testThat('boolean body rejected as invalid_body_type',
+            validateEventsRequest(true).code === 'invalid_body_type');
 
         const mixedBatch = validateEventsRequest([makeEvent(), makeEvent({ event_name: undefined })]);
         testThat('one bad event rejects whole batch', !mixedBatch.valid);
