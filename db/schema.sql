@@ -397,12 +397,19 @@ CREATE TABLE IF NOT EXISTS events (
     -- Identity (NULL for anonymous events; populated retroactively if user identifies)
     identity_id UUID REFERENCES identities(id) ON DELETE SET NULL,
     
-    -- Session and source (Bible Decision 20: cookieless, server-managed)
-    session_id UUID NOT NULL,
+    -- Session and source (Bible Decision 20: cookieless, server-managed).
+    -- session_id and device_fingerprint are opaque identifiers minted by
+    -- external systems (session stores, fingerprinting libraries). Core does not
+    -- own their format, so they are stored as length-bounded text, not UUIDs
+    -- (Bible Decision 7: Core constrains only what it owns). Nullable because an
+    -- event need only carry one of identity_id / session_id / device_fingerprint.
+    session_id VARCHAR(200),
+    device_fingerprint VARCHAR(200),
     source_type VARCHAR(50) NOT NULL,  -- 'web', 'mobile', 'server', 'import', etc.
     source_id VARCHAR(100),
-    
+
     -- Event identification (Bible Decision 8)
+    event_id UUID,  -- client-provided idempotency key; distinct from the Core-generated `id`
     event_name VARCHAR(100) NOT NULL,
     event_category VARCHAR(50) NOT NULL,
     
@@ -434,11 +441,18 @@ CREATE INDEX IF NOT EXISTS events_tenant_identity_time
 CREATE INDEX IF NOT EXISTS events_tenant_session 
     ON events (tenant_id, session_id, event_timestamp);
 
-CREATE INDEX IF NOT EXISTS events_pending_identification 
-    ON events (tenant_id, received_at) 
+CREATE INDEX IF NOT EXISTS events_pending_identification
+    ON events (tenant_id, received_at)
     WHERE retention_status = 'pending_identification';
 
-COMMENT ON TABLE events IS 
+-- Idempotency: a given client event_id may be submitted at most once per tenant.
+-- Partial predicate leaves any legacy rows without an event_id untouched while
+-- enforcing uniqueness for all captured events (Bible Decision 8).
+CREATE UNIQUE INDEX IF NOT EXISTS events_tenant_event_id
+    ON events (tenant_id, event_id)
+    WHERE event_id IS NOT NULL;
+
+COMMENT ON TABLE events IS
     'Normalized event stream. Bible Decisions 8, 9, 10, 15, 20, 21.';
 
 

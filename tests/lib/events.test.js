@@ -244,9 +244,23 @@ async function runTests() {
         test('identity_id only is valid',
             validateEvent(makeEvent({ session_id: undefined, identity_id: crypto.randomUUID() })).valid, true);
 
-        const badSession = validateEvent(makeEvent({ session_id: 'nope' }));
-        testThat('non-UUID session_id rejected', !badSession.valid &&
-            badSession.errors.some(e => e.field === 'session_id'));
+        // session_id is opaque: Core does not own its format, so a non-UUID
+        // string (Express/Rails/SDK session IDs are not UUIDs) must be accepted.
+        const opaqueSession = validateEvent(makeEvent({ session_id: 'sess_aBc123.XYZ-opaque' }));
+        test('non-UUID (opaque) session_id is valid', opaqueSession.valid, true);
+        test('opaque session_id preserved as-is',
+            opaqueSession.value.session_id, 'sess_aBc123.XYZ-opaque');
+
+        const ctrlSession = validateEvent(makeEvent({ session_id: 'sess\x00bad' }));
+        testThat('session_id with control character rejected', !ctrlSession.valid &&
+            ctrlSession.errors.some(e => e.field === 'session_id' && e.code === 'invalid_characters'));
+
+        const ctrlFingerprint = validateEvent(makeEvent({ session_id: undefined, device_fingerprint: 'fp\x07bad' }));
+        testThat('device_fingerprint with control character rejected', !ctrlFingerprint.valid &&
+            ctrlFingerprint.errors.some(e => e.field === 'device_fingerprint' && e.code === 'invalid_characters'));
+
+        const opaqueFingerprint = validateEvent(makeEvent({ session_id: undefined, device_fingerprint: 'fp-abc-123' }));
+        test('opaque device_fingerprint is valid', opaqueFingerprint.valid, true);
 
         const piiEvt = validateEvent(makeEvent({ properties: { email: 'jane@example.com' } }));
         testThat('PII in properties rejected', !piiEvt.valid &&

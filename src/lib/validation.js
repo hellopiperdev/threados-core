@@ -222,6 +222,66 @@ function validateUuid(value, fieldName) {
     return { valid: true, value: value.toLowerCase() };
 }
 
+// Optional opaque identifier: an ID minted by some external system whose format
+// Core does not own and therefore cannot dictate. Session IDs (Express, Rails,
+// frontend SDKs) and device fingerprints are opaque strings, not UUIDs. We only
+// constrain what Core legitimately owns: it must be a non-empty, length-bounded
+// string with no control characters (which would corrupt logs/storage). We do
+// NOT impose a UUID or any other shape. Absent (undefined/null/empty) is fine.
+function validateOptionalOpaqueId(value, fieldName, maxLength = 200) {
+    if (value === undefined || value === null) {
+        return { valid: true, value: null };
+    }
+
+    if (typeof value !== 'string') {
+        return {
+            valid: false,
+            error: {
+                field: fieldName,
+                code: 'invalid_type',
+                message: `${fieldName} must be a string`,
+            },
+        };
+    }
+
+    if (CONTROL_CHAR_REGEX.test(value)) {
+        return {
+            valid: false,
+            error: {
+                field: fieldName,
+                code: 'invalid_characters',
+                message: `${fieldName} must not contain control characters`,
+            },
+        };
+    }
+
+    const trimmed = value.trim();
+
+    if (trimmed === '') {
+        return {
+            valid: false,
+            error: {
+                field: fieldName,
+                code: 'missing',
+                message: `${fieldName} must not be empty`,
+            },
+        };
+    }
+
+    if (trimmed.length > maxLength) {
+        return {
+            valid: false,
+            error: {
+                field: fieldName,
+                code: 'too_long',
+                message: `${fieldName} must be ${maxLength} characters or fewer`,
+            },
+        };
+    }
+
+    return { valid: true, value: trimmed };
+}
+
 // ----------------------------------------------------------------------------
 // Composite validator for the identity/hash request
 // ----------------------------------------------------------------------------
@@ -294,5 +354,6 @@ module.exports = {
     validatePhone,
     validateName,
     validateUuid,
+    validateOptionalOpaqueId,
     validateIdentityHashRequest,
 };

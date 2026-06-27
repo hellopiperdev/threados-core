@@ -26,7 +26,7 @@
 // ============================================================================
 
 const { withTransaction } = require('./db');
-const { validateUuid } = require('./validation');
+const { validateUuid, validateOptionalOpaqueId } = require('./validation');
 
 // ----------------------------------------------------------------------------
 // Limits
@@ -270,25 +270,23 @@ function validateEvent(raw) {
     if (identityResult.valid) value.identity_id = identityResult.value;
     else errors.push(identityResult.error);
 
-    const sessionResult = validateOptionalUuid(raw.session_id, 'session_id');
+    // session_id and device_fingerprint are opaque identifiers minted by
+    // external systems (Express/Rails/SDK session stores, device fingerprinting
+    // libraries). Core does not own their format, so it cannot demand a UUID or
+    // any other shape - it only enforces what it legitimately owns: a non-empty,
+    // length-bounded string free of control characters.
+    const sessionResult = validateOptionalOpaqueId(raw.session_id, 'session_id');
     if (sessionResult.valid) value.session_id = sessionResult.value;
     else errors.push(sessionResult.error);
 
-    if (raw.device_fingerprint === undefined || raw.device_fingerprint === null || raw.device_fingerprint === '') {
-        value.device_fingerprint = null;
-    } else if (typeof raw.device_fingerprint !== 'string') {
-        errors.push({ field: 'device_fingerprint', code: 'invalid_type', message: 'device_fingerprint must be a string' });
-    } else if (raw.device_fingerprint.length > 200) {
-        errors.push({ field: 'device_fingerprint', code: 'too_long', message: 'device_fingerprint must be 200 characters or fewer' });
-    } else {
-        value.device_fingerprint = raw.device_fingerprint.trim();
-    }
+    const fingerprintResult = validateOptionalOpaqueId(raw.device_fingerprint, 'device_fingerprint');
+    if (fingerprintResult.valid) value.device_fingerprint = fingerprintResult.value;
+    else errors.push(fingerprintResult.error);
 
     // The "at least one identifier" check only makes sense once the individual
     // identifier fields have passed their own type checks.
     const identifierFieldsValid =
-        identityResult.valid && sessionResult.valid &&
-        (value.device_fingerprint !== undefined);
+        identityResult.valid && sessionResult.valid && fingerprintResult.valid;
 
     if (identifierFieldsValid) {
         const hasIdentifier =

@@ -108,3 +108,51 @@ CREATE UNIQUE INDEX IF NOT EXISTS events_tenant_event_id
 INSERT INTO schema_migrations (version, description)
 VALUES ('003_event_capture', 'Add event_id idempotency key + device_fingerprint, make session_id nullable for event capture')
 ON CONFLICT (version) DO NOTHING;
+
+
+-- ============================================================================
+-- Migration 004: session_id is an opaque external identifier
+-- ============================================================================
+--
+-- The base schema typed session_id as UUID. That was wrong: a session_id is
+-- minted by an external system (Express, Rails, frontend SDK session stores)
+-- whose format Core does not own and therefore cannot dictate. Real-world
+-- session IDs are opaque strings (e.g. "s%3AABC123.sig"), not UUIDs. Validation
+-- now accepts them as opaque (src/lib/validation.js validateOptionalOpaqueId),
+-- so the column must store them as text or every non-UUID session_id 500s on
+-- insert.
+--
+-- We retype to VARCHAR(200) to mirror device_fingerprint, the other opaque
+-- identifier on this table. The column is already nullable (migration 003), so
+-- only the type changes; existing UUID values cast cleanly to text.
+--
+-- No constraint blocks this: session_id has no foreign key, and the dependent
+-- index events_tenant_session (tenant_id, session_id, event_timestamp) is
+-- rebuilt automatically by ALTER COLUMN TYPE.
+--
+-- Guarded so repeat runs (the runner re-executes this whole file) don't trigger
+-- an unnecessary table rewrite once the column is already VARCHAR.
+--
+-- Bible references:
+--   Decision 7:  Core constrains only what Core owns; opaque external IDs are
+--                accepted as opaque, not forced into a Core-defined shape.
+--   Decision 20: Cookieless-first; session_id is a label captured with the
+--                event, not a Core-generated identity key.
+-- ============================================================================
+
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'events'
+          AND column_name = 'session_id'
+          AND data_type = 'uuid'
+    ) THEN
+        ALTER TABLE events
+            ALTER COLUMN session_id TYPE VARCHAR(200) USING session_id::text;
+    END IF;
+END $$;
+
+INSERT INTO schema_migrations (version, description)
+VALUES ('004_session_id_opaque', 'Retype events.session_id from UUID to VARCHAR(200): session_id is an opaque external identifier, not a Core-owned UUID')
+ON CONFLICT (version) DO NOTHING;

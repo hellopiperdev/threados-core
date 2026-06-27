@@ -246,6 +246,43 @@ async function runTests() {
             makeEvent({ event_timestamp: 'yesterday' }), validToken);
         test('bad timestamp returns 400', badTimestamp.statusCode, 400);
 
+        // session_id is opaque (Core does not own its format): a non-UUID
+        // session ID, as produced by Express/Rails/SDK session stores, is
+        // accepted end-to-end. The example below is a URL-encoded, signed
+        // Express session cookie value - exactly the kind of opaque string that
+        // would have 500'd against the old UUID column (migration 004).
+        const opaqueSessionId = 's%3AABC123.sig';
+        const opaqueEvt = makeEvent({ session_id: opaqueSessionId });
+        const opaqueSession = await request({ method: 'POST', path: PATH },
+            opaqueEvt, validToken);
+        test('opaque (non-UUID) session_id returns 201', opaqueSession.statusCode, 201);
+        test('opaque session_id created count 1', opaqueSession.body.created, 1);
+
+        // Round-trip: the value must persist intact, neither rejected nor
+        // mangled (no lowercasing, no reformatting).
+        const opaquePersisted = await query(
+            `SELECT session_id FROM events WHERE tenant_id = $1 AND event_id = $2`,
+            [testTenantId, opaqueEvt.event_id]
+        );
+        test('opaque session_id persisted intact',
+            opaquePersisted.rows[0].session_id, opaqueSessionId);
+
+        // Control characters in an opaque identifier are rejected - that's a
+        // shape Core does legitimately own.
+        const ctrlSession = await request({ method: 'POST', path: PATH },
+            makeEvent({ session_id: 'sess\x00bad' }), validToken);
+        test('control-character session_id returns 400', ctrlSession.statusCode, 400);
+        testThat('control-character session_id lists invalid_characters',
+            ctrlSession.body.error.details.some(
+                d => d.field === 'session_id' && d.code === 'invalid_characters'));
+
+        const ctrlFingerprint = await request({ method: 'POST', path: PATH },
+            makeEvent({ session_id: undefined, device_fingerprint: 'fp\x07bad' }), validToken);
+        test('control-character device_fingerprint returns 400', ctrlFingerprint.statusCode, 400);
+        testThat('control-character device_fingerprint lists invalid_characters',
+            ctrlFingerprint.body.error.details.some(
+                d => d.field === 'device_fingerprint' && d.code === 'invalid_characters'));
+
         // --------------------------------------------------------------------
         section('Errors: PII in properties (Decision 10)');
         // --------------------------------------------------------------------

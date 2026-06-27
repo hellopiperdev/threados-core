@@ -102,9 +102,9 @@ function statusForRejection(code) {
 //     "event_category": "engagement",(required, must match the registration)
 //     "source_type": "web",          (required)
 //     "event_timestamp": "ISO 8601", (required)
-//     "identity_id": "uuid",         (optional)
-//     "session_id": "uuid",          (optional)
-//     "device_fingerprint": "string",(optional)
+//     "identity_id": "uuid",         (optional, Core-owned UUID)
+//     "session_id": "string",        (optional, opaque external id)
+//     "device_fingerprint": "string",(optional, opaque external id)
 //     "source_id": "string",         (optional)
 //     "properties": { ... }          (optional, no PII allowed)
 //   }
