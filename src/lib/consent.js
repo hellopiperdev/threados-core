@@ -503,7 +503,29 @@ async function persistConsentRecords(client, tenantId, records) {
 
         // The SELECT's WHERE clause is the "currently in effect" test - when it
         // yields no row, nothing is inserted and ON CONFLICT never fires, so
-        // future-dated / expired records skip the projection entirely.
+        // future-dated / expired records skip the projection entirely. This IS
+        // the started-window guard from the Session 5 ruling: a future-dated
+        // record must not displace a currently-valid one and then have the
+        // reader filters deny during the gap before its window starts.
+        //
+        // FUTURE-ACTIVATION POSITION (Session 5 ruling, deliberate): a
+        // future-dated record is fully honored in history, point-in-time
+        // evaluation, and the backfill - but live-enforcement activation
+        // requires its window to have STARTED at write time. A vertical that
+        // wants scheduled activation writes the record at activation time;
+        // scheduling is module-layer responsibility (modules own workflow,
+        // Core owns truth). If verticals demonstrate real demand for
+        // Core-side activation, a projection-refresh sweep is the upgrade
+        // path.
+        //
+        // The DO UPDATE guard has two arms:
+        //   1. EXCLUDED.effective_from >= incumbent's - the supersession rule:
+        //      the decision with the latest valid-time start wins.
+        //   2. OR the incumbent's window has LAPSED - an expired row is
+        //      semantically "no row" (readers filter it out), so it holds no
+        //      supersession rights: a currently-valid record must be able to
+        //      replace it even with an earlier effective_from.
+        //
         // xmax = 0 distinguishes a fresh insert from a conflict-update: an
         // inserted row has no deleting/locking transaction recorded, an updated
         // row does. (Cast to text because xid has no direct integer equality
@@ -512,9 +534,9 @@ async function persistConsentRecords(client, tenantId, records) {
             `INSERT INTO current_consent (
                 tenant_id, identity_id, purpose, vendor, channel,
                 data_category, jurisdiction, state, consent_basis,
-                effective_from, source_record_id
+                effective_from, effective_until, source_record_id
              )
-             SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10::timestamptz, $12
+             SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10::timestamptz, $11::timestamptz, $12
              WHERE $10::timestamptz <= CURRENT_TIMESTAMP
                AND ($11::timestamptz IS NULL OR $11::timestamptz > CURRENT_TIMESTAMP)
              ON CONFLICT (tenant_id, identity_id, purpose, vendor, channel, data_category, jurisdiction)
@@ -522,8 +544,11 @@ async function persistConsentRecords(client, tenantId, records) {
                 state = EXCLUDED.state,
                 consent_basis = EXCLUDED.consent_basis,
                 effective_from = EXCLUDED.effective_from,
+                effective_until = EXCLUDED.effective_until,
                 source_record_id = EXCLUDED.source_record_id
              WHERE EXCLUDED.effective_from >= current_consent.effective_from
+                OR (current_consent.effective_until IS NOT NULL
+                    AND current_consent.effective_until <= CURRENT_TIMESTAMP)
              RETURNING (xmax::text = '0') AS was_insert`,
             [
                 tenantId,
@@ -683,6 +708,11 @@ function validateHistoryOptions(raw = {}) {
 // same table write-time enforcement reads). No rows means NO consent for
 // anything - a valid, meaningful state, not an error.
 //
+// The window filter (Session 5, finding HIGH-1) makes an expired grant
+// invisible the moment its validity window lapses, even though the physical
+// row lingers until the next write supersedes it: no visible row for the
+// tuple means no consent.
+//
 // Returns the flat rows in a deterministic dimension order; presentation
 // grouping is the HTTP layer's concern.
 // ----------------------------------------------------------------------------
@@ -690,9 +720,11 @@ function validateHistoryOptions(raw = {}) {
 async function getCurrentConsent(tenantId, identityId) {
     const result = await query(
         `SELECT purpose, vendor, channel, data_category, jurisdiction,
-                state, consent_basis, effective_from, source_record_id
+                state, consent_basis, effective_from, effective_until, source_record_id
          FROM current_consent
          WHERE tenant_id = $1 AND identity_id = $2
+           AND effective_from <= CURRENT_TIMESTAMP
+           AND (effective_until IS NULL OR effective_until > CURRENT_TIMESTAMP)
          ORDER BY purpose, vendor, channel, data_category, jurisdiction`,
         [tenantId, identityId]
     );

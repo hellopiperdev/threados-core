@@ -221,6 +221,7 @@ function groupCurrentConsent(rows) {
             state: row.state,
             consent_basis: row.consent_basis,
             effective_from: row.effective_from,
+            effective_until: row.effective_until,
             source_record_id: row.source_record_id,
         });
     }

@@ -471,6 +471,13 @@ CREATE TABLE IF NOT EXISTS current_consent (
 
     effective_from TIMESTAMP WITH TIME ZONE NOT NULL,
 
+    -- Validity window end (mirrors migration 007). NULL = open-ended. Readers
+    -- (write-time enforcement and the consent read API) filter to rows whose
+    -- window covers now: an expired grant is invisible the moment it lapses -
+    -- no row means no consent. No CHECK here: consent_records enforces the
+    -- window ordering at the source; the projection is derived data.
+    effective_until TIMESTAMP WITH TIME ZONE,
+
     -- The consent_records row that produced this current state. No cascade
     -- action: history rows are never deleted independently of their identity,
     -- and this FK makes a stray direct DELETE on consent_records fail loudly.
@@ -805,7 +812,8 @@ INSERT INTO schema_migrations (version, description) VALUES
     ('003_event_capture', 'Add event_id idempotency key + device_fingerprint, make session_id nullable for event capture'),
     ('004_session_id_opaque', 'Retype events.session_id from UUID to VARCHAR(200): session_id is an opaque external identifier, not a Core-owned UUID'),
     ('005_consent_data_model', 'Replace placeholder consent_records with bitemporal append-only consent history + current_consent projection (Step 7 Session 1)'),
-    ('006_event_type_implicated_purpose', 'Add implicated_purpose to event_type_registry: event types declare the consent purpose they implicate for write-time enforcement (Step 7 Session 4)')
+    ('006_event_type_implicated_purpose', 'Add implicated_purpose to event_type_registry: event types declare the consent purpose they implicate for write-time enforcement (Step 7 Session 4)'),
+    ('007_current_consent_effective_until', 'Add effective_until to current_consent so enforcement and reads can see expiry (Step 7 Session 5, finding HIGH-1)')
 ON CONFLICT (version) DO NOTHING;
 
 

@@ -233,12 +233,16 @@ Phase B in progress:
         Session 2 ✓ recording API (POST /api/v1/consent, projection maintenance)
         Session 3 ✓ read API (GET /api/v1/consent/:identity_id, history pagination)
         Session 4 ✓ write-time enforcement (rule map, 403/503) + Step 6 backfill
+        Session 5 ✓ robustness exploration + fixes (projection expiry HIGH-1,
+        future-activation position MEDIUM-1, gatekeeper polish)
+        Remaining: Session 6 API documentation (docs/api/consent.md, incl. the
+        backdated-withdrawal and future-activation positions)
   [ ] Step 8: Audit logging pipeline
   [ ] Step 9: Loyalty wallet
   [ ] Step 10: Production deployment to GCP
 ```
 
-Total tests passing: 887. Latest commit on `main` at time of writing: `78be8f9`.
+Total tests passing: 903. Latest commit on `main` at time of writing: `be627d0`.
 
 The Step 6 consent-snapshot backfill is implemented as `scripts/backfill-consent-snapshots.js` (idempotent, `--dry-run` supported); run it against any environment still holding `consent_snapshot->>'status' = 'not_evaluated'` rows.
 

@@ -709,6 +709,40 @@ async function runTests() {
         test('nothing persisted when consent could not be verified (fail-closed)',
             failClosedPersisted.rows[0].n, 0);
 
+        // ---- Clock boundaries (Session 5, HIGH-1 / MEDIUM-1) ----
+        const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+        // Expiring grant: capture allowed inside the window, denied the
+        // moment it lapses - no superseding write required.
+        const expIdn = await mkIdentity();
+        await seedConsent(expIdn, {
+            effective_from: new Date(Date.now() - 86400000).toISOString(),
+            effective_until: new Date(Date.now() + 1500).toISOString(),
+        });
+        const insideWindow = await captureEvents(tenantId, analyticsEvent(expIdn));
+        testThat('capture allowed inside the grant window', insideWindow.ok);
+        await sleep(2000);
+        const afterExpiry = await captureEvents(tenantId, analyticsEvent(expIdn));
+        testThat('capture DENIED once the grant window lapses (HIGH-1 closed)',
+            !afterExpiry.ok && afterExpiry.code === 'consent_denied');
+        testThat('post-expiry rejection reads as no consent record',
+            afterExpiry.errors[0].message.includes('no_consent_record'));
+
+        // Future-dated grant: denied before AND after its window starts (the
+        // documented position: live activation requires the window to have
+        // started at write time; verticals schedule at the module layer).
+        const futIdn = await mkIdentity();
+        await seedConsent(futIdn, {
+            effective_from: new Date(Date.now() + 1500).toISOString(),
+        });
+        const beforeStart = await captureEvents(tenantId, analyticsEvent(futIdn));
+        testThat('capture denied before a future grant starts',
+            !beforeStart.ok && beforeStart.code === 'consent_denied');
+        await sleep(2000);
+        const afterStart = await captureEvents(tenantId, analyticsEvent(futIdn));
+        testThat('capture still denied after the future start (documented position: write-time activation)',
+            !afterStart.ok && afterStart.code === 'consent_denied');
+
     } finally {
         section('Teardown');
         try {

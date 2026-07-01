@@ -470,11 +470,17 @@ async function checkConsent(client, tenantId, posture, events, purposesByName) {
     let rows = [];
     if (ids.length > 0) {
         try {
+            // The window filter (Session 5, finding HIGH-1) hides rows whose
+            // validity has lapsed or not yet started: an expired grant must
+            // not authorize capture, and no superseding write ever arrives
+            // for a grant that simply runs out.
             const result = await client.query(
                 `SELECT identity_id, purpose, state, consent_basis, effective_from, source_record_id
                  FROM current_consent
                  WHERE tenant_id = $1 AND identity_id = ANY($2)
-                   AND purpose = ANY($3) AND data_category = 'behavioral'`,
+                   AND purpose = ANY($3) AND data_category = 'behavioral'
+                   AND effective_from <= CURRENT_TIMESTAMP
+                   AND (effective_until IS NULL OR effective_until > CURRENT_TIMESTAMP)`,
                 [tenantId, ids, purposes]
             );
             rows = result.rows;

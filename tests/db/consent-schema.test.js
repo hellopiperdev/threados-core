@@ -259,6 +259,7 @@ async function runTests() {
         test('current_consent has exactly the designed columns',
             Object.keys(cc).sort(),
             ['channel', 'consent_basis', 'data_category', 'effective_from',
+             'effective_until', // added by migration 007 (Session 5, HIGH-1)
              'identity_id', 'jurisdiction', 'purpose', 'source_record_id',
              'state', 'tenant_id', 'updated_at', 'vendor'].sort());
 
@@ -286,8 +287,14 @@ async function runTests() {
                 name === 'effective_until' ? col.nullable : !col.nullable),
             'every column except effective_until must be NOT NULL');
 
-        testThat('all current_consent columns are NOT NULL',
-            Object.values(cc).every(col => !col.nullable));
+        // effective_until became the one nullable projection column in
+        // migration 007 (NULL = open-ended window), mirroring consent_records.
+        testThat('effective_until is the only nullable current_consent column',
+            Object.entries(cc).every(([name, col]) =>
+                name === 'effective_until' ? col.nullable : !col.nullable),
+            'every column except effective_until must be NOT NULL');
+        test('current_consent effective_until is timestamptz',
+            cc.effective_until.type, 'timestamp with time zone');
 
         // --------------------------------------------------------------------
         section('Primary key structure');

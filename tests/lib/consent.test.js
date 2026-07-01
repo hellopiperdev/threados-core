@@ -602,6 +602,64 @@ async function runTests() {
         test('read honors the history limit', fullRead.history.records.length, 3);
         test('read reports has_more for the truncated history', fullRead.history.has_more, true);
 
+        // --------------------------------------------------------------------
+        section('Clock boundaries: expiry and future windows (Session 5, HIGH-1)');
+        // --------------------------------------------------------------------
+
+        const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+        const secondsFromNow = (s) => new Date(Date.now() + s * 1000).toISOString();
+
+        const mkClockIdentity = async (seed) => {
+            const res = await query(
+                `INSERT INTO identities (tenant_id, email_hash, resolution_key, match_source)
+                 VALUES ($1, $2, $3, 'deterministic') RETURNING id`,
+                [tenantId, seed.repeat(32), seed.repeat(32).split('').reverse().join('')]
+            );
+            return res.rows[0].id;
+        };
+
+        // Expiring grant: valid at write time, lapses 1.5s later.
+        const expIdn = await mkClockIdentity('e5');
+        const expiring = await recordConsent(tenantId,
+            makeRecord({ identity_id: expIdn, effective_from: daysAgo(1), effective_until: secondsFromNow(1.5) }));
+        test('bounded grant valid now enters the projection',
+            expiring.results[0].projection, 'created');
+        const beforeExpiry = await getCurrentConsent(tenantId, expIdn);
+        test('bounded grant visible before expiry', beforeExpiry.length, 1);
+        testThat('read row carries its window end', beforeExpiry[0].effective_until !== null);
+
+        await sleep(2000);
+        test('expired grant is INVISIBLE the moment its window lapses',
+            await getCurrentConsent(tenantId, expIdn), []);
+
+        // Future-dated grant: never enters the projection; stays invisible
+        // even to reads (the documented future-activation position - live
+        // activation requires the window to have started at write time).
+        const futIdn = await mkClockIdentity('f5');
+        const future = await recordConsent(tenantId,
+            makeRecord({ identity_id: futIdn, effective_from: secondsFromNow(60) }));
+        test('future-dated grant stays history-only', future.results[0].projection, 'none');
+        test('future-dated grant invisible to current reads',
+            await getCurrentConsent(tenantId, futIdn), []);
+
+        // Expired incumbent holds no supersession rights: a currently-valid
+        // record with an EARLIER effective_from must be able to replace a
+        // lapsed row (guard arm 2) - an expired row is semantically "no row".
+        const vacIdn = await mkClockIdentity('a7');
+        await recordConsent(tenantId, makeRecord({
+            identity_id: vacIdn, effective_from: daysAgo(1), effective_until: secondsFromNow(1.5),
+        }));
+        await sleep(2000);
+        test('lapsed incumbent invisible', await getCurrentConsent(tenantId, vacIdn), []);
+        const revival = await recordConsent(tenantId, makeRecord({
+            identity_id: vacIdn, state: 'granted', effective_from: daysAgo(5), effective_until: null,
+        }));
+        test('currently-valid backdated record replaces the lapsed incumbent',
+            revival.results[0].projection, 'updated');
+        const revived = await getCurrentConsent(tenantId, vacIdn);
+        test('projection shows the reviving record', revived.length, 1);
+        test('reviving record is the visible decision', revived[0].state, 'granted');
+
     } catch (err) {
         failed++;
         console.error(`\n${colors.red}Test run aborted:${colors.reset}`, err);

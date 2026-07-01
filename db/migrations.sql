@@ -386,3 +386,50 @@ ALTER TABLE event_type_registry
 INSERT INTO schema_migrations (version, description)
 VALUES ('006_event_type_implicated_purpose', 'Add implicated_purpose to event_type_registry: event types declare the consent purpose they implicate for write-time enforcement (Step 7 Session 4)')
 ON CONFLICT (version) DO NOTHING;
+
+
+-- ============================================================================
+-- Migration 007: current_consent carries the validity window's end
+-- ============================================================================
+--
+-- Session 5 robustness exploration (HIGH-1): a grant whose effective_until
+-- lapses by clock-tick stayed in the projection as 'granted' forever - the
+-- projection had no effective_until column, so neither write-time enforcement
+-- nor the read API could see the expiry, and no superseding write ever
+-- arrives for a grant that simply runs out. Capture succeeded on lapsed
+-- consent, and the stored snapshot asserted an authorization that had
+-- expired - a Decision 15 violation.
+--
+-- Fix (Session 5 ruling): the projection stores effective_until, the upsert
+-- writes it, and both readers (the enforcement lookup in src/lib/events.js
+-- and getCurrentConsent in src/lib/consent.js) filter to rows whose window
+-- covers now. An expired grant becomes invisible the moment its window
+-- lapses: no row for the tuple means no consent - the invariant doing its
+-- job. Lapsed rows may linger physically until the next write supersedes
+-- them; the reader filters make them inert.
+--
+-- No CHECK constraint here (consent_records already enforces
+-- effective_until > effective_from at the source; the projection is derived
+-- data, and keeping both build paths' constraint sets identical matters
+-- more than a redundant second check).
+--
+-- The backfill UPDATE is idempotent (IS DISTINCT FROM makes re-runs no-ops)
+-- and copies the window end from each projection row's source record.
+--
+-- Bible references:
+--   Decision 15: Write-time consent enforcement - the projection must not
+--                assert consent whose validity window has ended.
+-- ============================================================================
+
+ALTER TABLE current_consent
+    ADD COLUMN IF NOT EXISTS effective_until TIMESTAMP WITH TIME ZONE;
+
+UPDATE current_consent
+SET effective_until = cr.effective_until
+FROM consent_records cr
+WHERE cr.record_id = current_consent.source_record_id
+  AND current_consent.effective_until IS DISTINCT FROM cr.effective_until;
+
+INSERT INTO schema_migrations (version, description)
+VALUES ('007_current_consent_effective_until', 'Add effective_until to current_consent so enforcement and reads can see expiry (Step 7 Session 5, finding HIGH-1)')
+ON CONFLICT (version) DO NOTHING;
