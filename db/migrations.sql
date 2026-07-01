@@ -345,3 +345,44 @@ COMMENT ON TABLE current_consent IS
 INSERT INTO schema_migrations (version, description)
 VALUES ('005_consent_data_model', 'Replace placeholder consent_records with bitemporal append-only consent history + current_consent projection (Step 7 Session 1)')
 ON CONFLICT (version) DO NOTHING;
+
+-- ============================================================================
+-- Migration 006: Event types declare their implicated consent purpose
+-- ============================================================================
+--
+-- Write-time consent enforcement (Step 7 Session 4, Bible Decision 15) needs
+-- to know which consent purpose an event implicates. Purpose cannot be a
+-- constant: Decision 14's Standard posture accepts legitimate interest "for
+-- operational events" - so an order-status event implicates
+-- service_operations while a page view implicates analytics, and only the
+-- vertical knows which. Decision 13: "verticals declare which regulatory
+-- regimes apply to their events" - the event type registry is where that
+-- declaration lives.
+--
+-- The default is 'analytics' - the most consent-gated purpose an event can
+-- implicate (it never passes without active consent / documented opt-in
+-- under any posture) - so an event type that never declared a purpose fails
+-- CLOSED, not open. Existing registry rows get the same conservative
+-- default.
+--
+-- The vocabulary mirrors the consent purpose CHECK on consent_records.
+-- Marketing/personalization are activation purposes, not capture purposes,
+-- but the column accepts the full vocabulary: Core doesn't preempt a
+-- vertical declaring an event type it genuinely captures for marketing - the
+-- rule map simply demands active consent for it.
+--
+-- Bible references:
+--   Decision 13: Multi-dimensional consent model (verticals declare regimes)
+--   Decision 14: Tenant-level compliance postures
+--   Decision 15: Write-time consent enforcement
+-- ============================================================================
+
+ALTER TABLE event_type_registry
+    ADD COLUMN IF NOT EXISTS implicated_purpose VARCHAR(30) NOT NULL DEFAULT 'analytics'
+    CONSTRAINT event_type_registry_implicated_purpose_check
+    CHECK (implicated_purpose IN ('marketing', 'personalization', 'analytics',
+                                  'service_operations', 'legal_compliance', 'fraud_prevention'));
+
+INSERT INTO schema_migrations (version, description)
+VALUES ('006_event_type_implicated_purpose', 'Add implicated_purpose to event_type_registry: event types declare the consent purpose they implicate for write-time enforcement (Step 7 Session 4)')
+ON CONFLICT (version) DO NOTHING;

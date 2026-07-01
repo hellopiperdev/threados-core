@@ -364,6 +364,66 @@ async function runTests() {
             noTenant.headers['x-service'] === 'threados-core');
 
         // --------------------------------------------------------------------
+        section('Consent enforcement at the route (Decision 15)');
+        // --------------------------------------------------------------------
+
+        // The test tenant is strict-posture (schema default). An identified
+        // event with no consent on the books must be a 403 - well-formed,
+        // everything exists, the operation is forbidden.
+        const noConsentEvt = makeEvent({ identity_id: testIdentityId });
+        const forbidden = await request({ method: 'POST', path: PATH }, noConsentEvt, validToken);
+        test('identified event without consent returns 403', forbidden.statusCode, 403);
+        test('403 carries consent_denied code', forbidden.body.error.code, 'consent_denied');
+        testThat('consent detail names the purpose and reason',
+            forbidden.body.error.details.some(d =>
+                d.code === 'consent_denied' && d.message.includes('analytics') &&
+                d.message.includes('no_consent_record')));
+        const forbiddenPersisted = await query(
+            `SELECT count(*)::int AS n FROM events WHERE tenant_id = $1 AND event_id = $2`,
+            [testTenantId, noConsentEvt.event_id]);
+        test('403-rejected event was not persisted', forbiddenPersisted.rows[0].n, 0);
+
+        // Grant consent through the real consent API, then capture succeeds
+        // and the snapshot records the evaluation.
+        const consentGrant = await request(
+            { method: 'POST', path: '/api/v1/consent' },
+            {
+                identity_id: testIdentityId,
+                purpose: 'analytics',
+                vendor: 'acme_dms',
+                channel: 'in_app',
+                data_category: 'behavioral',
+                jurisdiction: 'US',
+                state: 'granted',
+                consent_basis: 'active_consent',
+                captured_via: 'web_form',
+                capture_context: 'Route-test consent grant',
+                reason: 'Enforcement route test fixture',
+                effective_from: new Date(Date.now() - 86400000).toISOString(),
+            },
+            validToken);
+        test('consent grant recorded via the consent API', consentGrant.statusCode, 201);
+
+        // Fail-closed 503: break the consent lookup deterministically, then
+        // restore. Nothing may persist while consent is unverifiable.
+        const unavailableEvt = makeEvent({ identity_id: testIdentityId });
+        await query(`ALTER TABLE current_consent RENAME TO current_consent_broken`);
+        let unavailable;
+        try {
+            unavailable = await request({ method: 'POST', path: PATH }, unavailableEvt, validToken);
+        } finally {
+            await query(`ALTER TABLE current_consent_broken RENAME TO current_consent`);
+        }
+        test('consent lookup failure returns 503', unavailable.statusCode, 503);
+        test('503 carries consent_check_unavailable code',
+            unavailable.body.error.code, 'consent_check_unavailable');
+        const unavailablePersisted = await query(
+            `SELECT count(*)::int AS n FROM events WHERE tenant_id = $1 AND event_id = $2`,
+            [testTenantId, unavailableEvt.event_id]);
+        test('nothing persisted while consent was unverifiable (fail-closed)',
+            unavailablePersisted.rows[0].n, 0);
+
+        // --------------------------------------------------------------------
         section('Success: single event');
         // --------------------------------------------------------------------
 
@@ -375,6 +435,17 @@ async function runTests() {
         test('result status is created', created.body.results[0].status, 'created');
         test('result echoes event_id', created.body.results[0].event_id, evt.event_id);
         testThat('result includes Core id', !!created.body.results[0].id);
+
+        const snapRow = await query(
+            `SELECT consent_snapshot FROM events WHERE tenant_id = $1 AND event_id = $2`,
+            [testTenantId, evt.event_id]);
+        testThat('persisted snapshot records the granted evaluation',
+            snapRow.rows[0].consent_snapshot.status === 'granted' &&
+            snapRow.rows[0].consent_snapshot.posture === 'strict' &&
+            snapRow.rows[0].consent_snapshot.purpose === 'analytics' &&
+            snapRow.rows[0].consent_snapshot.basis === 'active_consent' &&
+            !!snapRow.rows[0].consent_snapshot.source_record_id,
+            JSON.stringify(snapRow.rows[0].consent_snapshot));
 
         // --------------------------------------------------------------------
         section('Idempotency: replay is a no-op success');
@@ -402,6 +473,15 @@ async function runTests() {
         test('batch returns 201', batch.statusCode, 201);
         test('batch created count 2', batch.body.created, 2);
         test('batch returns two results', batch.body.results.length, 2);
+
+        // Anonymous events (session-only) are not consent-rejected; they carry
+        // the explicit holding-pattern snapshot pending Decision 21.
+        const anonSnap = await query(
+            `SELECT consent_snapshot FROM events WHERE tenant_id = $1 AND event_id = $2`,
+            [testTenantId, a.event_id]);
+        testThat('anonymous event snapshot records anonymous_holding',
+            anonSnap.rows[0].consent_snapshot.status === 'anonymous_holding',
+            JSON.stringify(anonSnap.rows[0].consent_snapshot));
 
         // --------------------------------------------------------------------
         section('Reject-all: one bad event sinks the batch (Decision 7)');

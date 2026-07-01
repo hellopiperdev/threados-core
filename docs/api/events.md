@@ -303,21 +303,29 @@ For capture rejections (validation, registry, identity, tenant), the top-level `
 | 422    | `unregistered_event`    | An event references an `event_name`/`event_category` pair that is not registered (or whose category contradicts the registration) for this tenant. See `details`. |
 | 422    | `identity_not_found`    | An event references an `identity_id` that does not exist (or is soft-deleted) for this tenant. See `details`. |
 
-#### Server errors (503)
+#### Consent errors (403 Forbidden)
 
 | Status | Error code              | Cause                                                |
 |--------|-------------------------|------------------------------------------------------|
-| 503    | `service_unavailable`   | Core cannot verify the request (e.g., JWKS endpoint unreachable) or the database is temporarily unavailable. Retry the request. |
+| 403    | `consent_denied`        | An identified event lacks valid consent for its purpose: no consent record, an explicit denial/withdrawal, or a consent basis the tenant's posture does not accept. Reject-all: the whole batch is rejected. See `details` and the Consent Enforcement section below. |
 
-#### The 404-vs-422 Convention
+#### Server errors (503)
+
+| Status | Error code                  | Cause                                                |
+|--------|-----------------------------|------------------------------------------------------|
+| 503    | `service_unavailable`       | Core cannot verify the request (e.g., JWKS endpoint unreachable) or the database is temporarily unavailable. Retry the request. |
+| 503    | `consent_check_unavailable` | The consent lookup failed (infrastructure). Fail-closed: nothing was stored. Retry the request. |
+
+#### The 404-vs-422 Convention (and where 403 fits)
 
 This is a deliberate, Core-wide rule (`statusForRejection` in `src/routes/events.js`):
 
 - **404 is reserved exclusively for the tenant named by the JWT `sub` claim.** It means "the tenant your token addresses does not exist." Nothing else returns 404.
 - **422 is for every other reference, evaluated within an authenticated, existing-tenant context, that doesn't resolve or violates a registry constraint** — an unregistered event type, an `event_category` that contradicts the registration, or an `identity_id` not present in this tenant. The payload is well-formed; what it points at is the problem.
+- **403 is for consent** — the payload is well-formed and everything it references exists; the customer has not consented to the operation. Nothing is missing; the operation is forbidden.
 - **400 is for a malformed payload** — missing or ill-typed fields, a bad timestamp, PII in properties, or a wrong top-level body type. The client can fix it by correcting the bytes it sent.
 
-In short: 404 = "the tenant in your token is gone," 422 = "your well-formed request references something else that isn't there / isn't allowed," 400 = "your payload is malformed."
+In short: 404 = "the tenant in your token is gone," 422 = "your well-formed request references something else that isn't there / isn't allowed," 403 = "consent forbids this," 400 = "your payload is malformed."
 
 ### Validation Error Details
 
@@ -407,7 +415,7 @@ The rule this enforces: customer-identifying data routes through `POST /api/v1/i
 
 Every event requires at least one of `identity_id`, `session_id`, or `device_fingerprint`. Events failing this are rejected at validation (`missing_identifier`). `session_id` and `device_fingerprint` are opaque external identifiers — Core enforces only that they are non-empty, length-bounded (≤ 200 chars), control-character-free strings, not any particular format.
 
-**Known gap — anonymous holding pattern.** Bible Decision 21 specifies a future dual-track scheme for events without an `identity_id` (30-day individual retention plus permanent aggregate counters). It is not implemented. All events currently persist with `retention_status = 'standard'`.
+**Known gap — anonymous holding pattern.** Bible Decision 21 specifies a future dual-track scheme for events without an `identity_id` (30-day individual retention plus permanent aggregate counters). It is not implemented. Anonymous events currently persist with `retention_status = 'standard'` and an explicit `anonymous_holding` consent snapshot (see Consent Enforcement below) marking them as pending that implementation.
 
 ### Idempotency
 
@@ -419,25 +427,49 @@ Note the distinction from intra-batch duplicates: two events with the **same** `
 
 ### Batch Validation Contract
 
-Any failure within a batch — field validation, intra-batch duplicate, registry check, or identity check — rejects the entire request. Nothing is written (reject-all, Bible Decision 7). Field-validation errors are collected across all events and returned together so the client sees every problem in one response rather than fixing them one at a time. (Registry and identity checks run after field validation passes, so their errors are returned on their own pass, not interleaved with field errors.)
+Any failure within a batch — field validation, intra-batch duplicate, registry check, identity check, or consent check — rejects the entire request. Nothing is written (reject-all, Bible Decision 7). Field-validation errors are collected across all events and returned together so the client sees every problem in one response rather than fixing them one at a time. (Registry and identity checks run after field validation passes, so their errors are returned on their own pass, not interleaved with field errors.)
 
 ### Tenant Isolation
 
 Events are scoped to the tenant in the JWT `sub` claim. Registry checks, identity-existence checks, and inserts are all filtered by that tenant id. Cross-tenant access is structurally impossible: a vertical sees and writes only its own tenants' data, and the tenant is never taken from the request body.
 
-### Consent Enforcement
+### Consent Enforcement (Bible Decisions 13, 14, 15)
 
-Events currently persist with a placeholder consent snapshot:
+Every **identified** event (one carrying an `identity_id`) is checked against consent before storage. Events without valid consent for their purpose are rejected at write time — Core does not store what it should not have.
+
+**What capture implicates.** Event capture implicates `data_category = 'behavioral'` with the **purpose declared per event type** in the registry (`event_type_registry.implicated_purpose`, declared by the vertical at registration, default `'analytics'` — the most consent-gated capture purpose, so undeclared event types fail closed). The other consent dimensions — vendor, channel, jurisdiction — are not implicated at capture time (they govern outbound use and are enforced at those touchpoints); instead, all `current_consent` rows matching the identity + purpose + behavioral tuple are evaluated with **deny-precedence**: an explicit denial or withdrawal on *any* matching row rejects capture, even if another row is granted.
+
+**The rule.** With no matching rows, capture is rejected — no record means no consent. With a denial/withdrawal, rejected. Otherwise a granted row must pass the **basis × posture × purpose** rule map (`src/lib/enforcement.js`; the tenant's `compliance_posture` is Strict, Standard, or Legacy per Bible Decision 14). Active consent and documented opt-in authorize all purposes under every posture. Legitimate interest authorizes only operational purposes (`service_operations`, `fraud_prevention`) under Standard/Legacy, never under Strict, and never analytics. Contract authorizes `service_operations` only (Standard/Legacy). Legal obligation authorizes `legal_compliance` only. Undocumented consent authorizes nothing except limited-use purposes (`service_operations`, `legal_compliance`, `fraud_prevention`) under Legacy. The map is static Core code — not per-tenant configurable.
+
+**Fail modes (fail-closed, fail-honest).**
+
+- `403 consent_denied` — the request is well-formed and everything it references exists; the customer has not consented (no record, explicit denial/withdrawal, or an insufficient basis for the purpose under the tenant's posture). Reject-all: one non-consented event rejects the whole batch. Per-event details name the purpose and reason.
+- `503 consent_check_unavailable` — the consent lookup itself failed (infrastructure). Nothing was stored; the transaction rolled back. Retry is appropriate.
+
+**The snapshot.** Persisted events carry the actual evaluation in `consent_snapshot`:
 
 ```json
-{ "status": "not_evaluated", "reason": "consent_enforcement_pending_step_7" }
+{
+  "status": "granted",
+  "posture": "strict",
+  "purpose": "analytics",
+  "basis": "active_consent",
+  "source_record_id": "<the consent_records row that authorized capture>",
+  "evaluated_at": "2026-07-01T00:00:00.000Z"
+}
 ```
 
-The `events.consent_snapshot` column is non-null, so Core writes this explicit "not evaluated" marker rather than a fabricated granted/denied decision. Real write-time consent evaluation arrives in Step 7 (Bible Decision 15), which will also decide the disposition of the historical events written during Step 6 (findable by `consent_snapshot->>'status' = 'not_evaluated'`). Until then, events are captured but **not** consent-gated.
+**Anonymous events** (session/device only, no `identity_id`) are **not** consent-rejected — Decision 15 assigns them to the 30-day holding pattern (Decision 21, designed but not yet implemented). They persist with:
+
+```json
+{ "status": "anonymous_holding", "reason": "pre_identification_holding_pending_decision_21", "evaluated_at": "..." }
+```
+
+**Pre-enforcement (Step 6) events.** Events captured before this enforcement existed carried `{"status": "not_evaluated"}`. `scripts/backfill-consent-snapshots.js` re-evaluates them **point-in-time** — against the consent in effect at each event's `event_timestamp`, reconstructed from the bitemporal `consent_records` history — under the same rule map. Passing events get a granted snapshot (marked `"backfilled": true`); failing events get a denied snapshot and `retention_status = 'expired'` (quarantined out of read paths; purging belongs to the retention/erasure workflow); anonymous events get the holding snapshot. The script is idempotent and supports `--dry-run`.
 
 ### Synchronous Persistence
 
-The endpoint returns a 2xx only after all events in the request are durably written. The full pipeline — tenant check, registry check, identity check, inserts — runs inside a single database transaction; the batch commits all-or-nothing. There is no async-write-ahead pattern (Bible Decision 17). Async ingestion via Pub/Sub is tracked as future work, to be taken on when synchronous persistence shows scaling pain.
+The endpoint returns a 2xx only after all events in the request are durably written. The full pipeline — tenant check, registry check, identity check, consent enforcement, inserts — runs inside a single database transaction; the batch commits all-or-nothing. There is no async-write-ahead pattern (Bible Decision 17). Async ingestion via Pub/Sub is tracked as future work, to be taken on when synchronous persistence shows scaling pain.
 
 ---
 
@@ -451,7 +483,9 @@ Returns Core's own JWKS document (Core's public keys, for services that need to 
 
 ## Implementation References
 
-- Event capture business logic (validation, PII scan, registry/identity checks, persistence): `src/lib/events.js`
+- Event capture business logic (validation, PII scan, registry/identity/consent checks, persistence): `src/lib/events.js`
+- Consent enforcement rule map (basis × posture × purpose): `src/lib/enforcement.js`
+- Pre-enforcement (Step 6) event backfill: `scripts/backfill-consent-snapshots.js`
 - Route handler and status-code mapping (`statusForRejection`): `src/routes/events.js`
 - Shared field validators (`validateUuid`, `validateOptionalOpaqueId`): `src/lib/validation.js`
 - PII hashing (identity API path): `src/lib/hashing.js`

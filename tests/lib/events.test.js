@@ -28,6 +28,7 @@ const {
     captureEvents,
     MAX_BATCH_SIZE,
 } = require('../../src/lib/events');
+const { recordConsent } = require('../../src/lib/consent');
 
 // ----------------------------------------------------------------------------
 // Test runner state
@@ -102,6 +103,50 @@ function makeEvent(overrides = {}) {
         properties: { path: '/home', referrer: 'google' },
         ...overrides,
     };
+}
+
+// --- Consent-enforcement helpers (Step 7 Session 4) -------------------------
+
+// Mint a fresh identity so each enforcement scenario starts with a clean
+// consent slate.
+async function mkIdentity() {
+    const hash = crypto.randomBytes(32).toString('hex');
+    const key = crypto.randomBytes(32).toString('hex');
+    const res = await query(
+        `INSERT INTO identities (tenant_id, email_hash, resolution_key, match_source)
+         VALUES ($1, $2, $3, 'deterministic') RETURNING id`,
+        [tenantId, hash, key]
+    );
+    return res.rows[0].id;
+}
+
+// Record a consent decision through the real write path (Session 2), so the
+// current_consent projection enforcement reads is maintained for real.
+async function seedConsent(idnId, overrides = {}) {
+    const result = await recordConsent(tenantId, {
+        identity_id: idnId,
+        purpose: 'analytics',
+        vendor: 'acme_dms',
+        channel: 'in_app',
+        data_category: 'behavioral',
+        jurisdiction: 'US',
+        state: 'granted',
+        consent_basis: 'active_consent',
+        captured_via: 'web_form',
+        capture_context: 'Seeded by events enforcement tests',
+        reason: 'Test fixture consent decision',
+        effective_from: new Date(Date.now() - 86400000).toISOString(),
+        effective_until: null,
+        ...overrides,
+    });
+    if (!result.ok) {
+        throw new Error(`seedConsent failed: ${JSON.stringify(result.errors)}`);
+    }
+    return result;
+}
+
+async function setPosture(posture) {
+    await query(`UPDATE tenants SET compliance_posture = $1 WHERE id = $2`, [posture, tenantId]);
 }
 
 async function setup() {
@@ -413,6 +458,11 @@ async function runTests() {
         section('captureEvents: persistence + idempotency (Decision 17)');
         // --------------------------------------------------------------------
 
+        // The test tenant is strict-posture (the schema default), so an
+        // identified capture needs an active-consent grant on the books
+        // (Step 7 Session 4: capture is consent-enforced).
+        await seedConsent(identityId);
+
         const evt = makeEvent({ identity_id: identityId });
         const first = await captureEvents(tenantId, evt);
         test('first capture ok', first.ok, true);
@@ -430,8 +480,15 @@ async function runTests() {
         test('event persisted exactly once', row.rows.length, 1);
         test('persisted event_name', row.rows[0].event_name, 'page_viewed');
         test('persisted validation_status valid', row.rows[0].validation_status, 'valid');
-        testThat('consent_snapshot marked not_evaluated',
-            row.rows[0].consent_snapshot && row.rows[0].consent_snapshot.status === 'not_evaluated');
+        testThat('consent_snapshot records the granted evaluation',
+            row.rows[0].consent_snapshot && row.rows[0].consent_snapshot.status === 'granted',
+            JSON.stringify(row.rows[0].consent_snapshot));
+        testThat('snapshot cites posture, purpose, basis, and the authorizing record',
+            row.rows[0].consent_snapshot.posture === 'strict' &&
+            row.rows[0].consent_snapshot.purpose === 'analytics' &&
+            row.rows[0].consent_snapshot.basis === 'active_consent' &&
+            !!row.rows[0].consent_snapshot.source_record_id,
+            JSON.stringify(row.rows[0].consent_snapshot));
 
         // Re-submitting the same event_id is a no-op success (idempotency).
         const second = await captureEvents(tenantId, evt);
@@ -484,6 +541,173 @@ async function runTests() {
 
         const noTenant = await captureEvents('00000000-0000-0000-0000-000000000000', makeEvent());
         testThat('nonexistent tenant rejected', !noTenant.ok && noTenant.code === 'tenant_not_found');
+
+        // --------------------------------------------------------------------
+        section('captureEvents: consent enforcement (Decision 15)');
+        // --------------------------------------------------------------------
+
+        // Event types with declared purposes (migration 006) for the
+        // enforcement scenarios. page_viewed keeps the analytics default.
+        await query(
+            `INSERT INTO event_type_registry (tenant_id, event_name, event_category, implicated_purpose)
+             VALUES ($1, 'order_status_updated', 'operations', 'service_operations'),
+                    ($1, 'consent_receipt_issued', 'compliance', 'legal_compliance')
+             ON CONFLICT (tenant_id, event_name) DO NOTHING`,
+            [tenantId]
+        );
+        const opsEvent = (idn) => makeEvent({
+            event_name: 'order_status_updated', event_category: 'operations', identity_id: idn,
+        });
+        const complianceEvent = (idn) => makeEvent({
+            event_name: 'consent_receipt_issued', event_category: 'compliance', identity_id: idn,
+        });
+        const analyticsEvent = (idn) => makeEvent({ identity_id: idn });
+
+        // ---- Strict posture (the tenant default) ----
+        await setPosture('strict');
+
+        const noRecord = await captureEvents(tenantId, analyticsEvent(await mkIdentity()));
+        testThat('strict: no consent record -> consent_denied',
+            !noRecord.ok && noRecord.code === 'consent_denied');
+        testThat('rejection message names the reason',
+            noRecord.errors[0].message.includes('no_consent_record'));
+
+        const deniedIdn = await mkIdentity();
+        await seedConsent(deniedIdn, { state: 'denied' });
+        const denied = await captureEvents(tenantId, analyticsEvent(deniedIdn));
+        testThat('strict: denied state -> consent_denied',
+            !denied.ok && denied.errors[0].message.includes('consent_denied'));
+
+        const withdrawnIdn = await mkIdentity();
+        await seedConsent(withdrawnIdn, { state: 'withdrawn' });
+        const withdrawn = await captureEvents(tenantId, analyticsEvent(withdrawnIdn));
+        testThat('strict: withdrawn state -> consent_denied',
+            !withdrawn.ok && withdrawn.errors[0].message.includes('consent_withdrawn'));
+
+        const liStrictIdn = await mkIdentity();
+        await seedConsent(liStrictIdn, {
+            purpose: 'service_operations', consent_basis: 'legitimate_interest',
+        });
+        const liStrict = await captureEvents(tenantId, opsEvent(liStrictIdn));
+        testThat('strict: legitimate_interest rejected even for operational events',
+            !liStrict.ok && liStrict.code === 'consent_denied');
+
+        const legalIdn = await mkIdentity();
+        await seedConsent(legalIdn, {
+            purpose: 'legal_compliance', consent_basis: 'legal_obligation',
+        });
+        const legalStrict = await captureEvents(tenantId, complianceEvent(legalIdn));
+        testThat('strict: legal_obligation authorizes legal_compliance events',
+            legalStrict.ok);
+
+        const optInIdn = await mkIdentity();
+        await seedConsent(optInIdn, { consent_basis: 'documented_opt_in' });
+        const optIn = await captureEvents(tenantId, analyticsEvent(optInIdn));
+        testThat('strict: documented_opt_in authorizes analytics', optIn.ok);
+
+        // ---- Standard posture ----
+        await setPosture('standard');
+
+        const liStdIdn = await mkIdentity();
+        await seedConsent(liStdIdn, {
+            purpose: 'service_operations', consent_basis: 'legitimate_interest',
+        });
+        const liStdOps = await captureEvents(tenantId, opsEvent(liStdIdn));
+        testThat('standard: legitimate_interest authorizes operational events', liStdOps.ok);
+
+        const liStdAnalyticsIdn = await mkIdentity();
+        await seedConsent(liStdAnalyticsIdn, { consent_basis: 'legitimate_interest' });
+        const liStdAnalytics = await captureEvents(tenantId, analyticsEvent(liStdAnalyticsIdn));
+        testThat('standard: legitimate_interest does NOT authorize analytics',
+            !liStdAnalytics.ok && liStdAnalytics.errors[0].message.includes('basis_insufficient'));
+
+        const contractIdn = await mkIdentity();
+        await seedConsent(contractIdn, {
+            purpose: 'service_operations', consent_basis: 'contract',
+        });
+        const contractStd = await captureEvents(tenantId, opsEvent(contractIdn));
+        testThat('standard: contract authorizes service_operations events', contractStd.ok);
+
+        const undocStdIdn = await mkIdentity();
+        await seedConsent(undocStdIdn, {
+            purpose: 'service_operations', consent_basis: 'undocumented',
+        });
+        const undocStd = await captureEvents(tenantId, opsEvent(undocStdIdn));
+        testThat('standard: undocumented rejected even for operational events',
+            !undocStd.ok && undocStd.code === 'consent_denied');
+
+        // ---- Legacy posture ----
+        await setPosture('legacy');
+
+        const undocLegacyIdn = await mkIdentity();
+        await seedConsent(undocLegacyIdn, {
+            purpose: 'service_operations', consent_basis: 'undocumented',
+        });
+        const undocLegacyOps = await captureEvents(tenantId, opsEvent(undocLegacyIdn));
+        testThat('legacy: undocumented authorizes operational events (limited use)',
+            undocLegacyOps.ok);
+
+        const undocLegacyAnIdn = await mkIdentity();
+        await seedConsent(undocLegacyAnIdn, { consent_basis: 'undocumented' });
+        const undocLegacyAnalytics = await captureEvents(tenantId, analyticsEvent(undocLegacyAnIdn));
+        testThat('legacy: undocumented never authorizes analytics',
+            !undocLegacyAnalytics.ok && undocLegacyAnalytics.code === 'consent_denied');
+
+        // ---- Deny-precedence across non-implicated dimensions ----
+        await setPosture('strict');
+
+        const denyPrecIdn = await mkIdentity();
+        await seedConsent(denyPrecIdn, { vendor: 'vendor_a', state: 'granted' });
+        await seedConsent(denyPrecIdn, { vendor: 'vendor_b', state: 'denied' });
+        const denyPrec = await captureEvents(tenantId, analyticsEvent(denyPrecIdn));
+        testThat('a denial on ANY matching row blocks capture (deny-precedence)',
+            !denyPrec.ok && denyPrec.code === 'consent_denied');
+
+        // ---- Anonymous events: holding pattern, not rejection ----
+        const anonEvt = makeEvent();
+        const anonCapture = await captureEvents(tenantId, anonEvt);
+        testThat('anonymous event captured without consent lookup', anonCapture.ok);
+        const anonRow = await query(
+            `SELECT consent_snapshot FROM events WHERE tenant_id = $1 AND event_id = $2`,
+            [tenantId, anonEvt.event_id]);
+        testThat('anonymous snapshot records the holding pattern (Decision 21 pending)',
+            anonRow.rows[0].consent_snapshot.status === 'anonymous_holding',
+            JSON.stringify(anonRow.rows[0].consent_snapshot));
+
+        // ---- Reject-all: consent failures reject the whole batch ----
+        const anonInBatch = makeEvent();
+        const mixedConsentBatch = await captureEvents(tenantId, [
+            anonInBatch,
+            analyticsEvent(await mkIdentity()),   // fresh identity, no consent
+        ]);
+        testThat('batch with one non-consented event rejected entirely',
+            !mixedConsentBatch.ok && mixedConsentBatch.code === 'consent_denied');
+        testThat('consent errors carry the failing event index',
+            mixedConsentBatch.errors[0].index === 1);
+        const anonPersisted = await query(
+            `SELECT count(*)::int AS n FROM events WHERE tenant_id = $1 AND event_id = $2`,
+            [tenantId, anonInBatch.event_id]);
+        test('reject-all: the anonymous sibling was not persisted', anonPersisted.rows[0].n, 0);
+
+        // ---- Fail-closed on consent-check infrastructure failure ----
+        // Break the consent lookup deterministically by renaming the table,
+        // then restore it. The failing query aborts the transaction, so the
+        // whole batch rolls back: fail-closed, reported honestly.
+        const failClosedEvt = makeEvent({ identity_id: identityId });
+        await query(`ALTER TABLE current_consent RENAME TO current_consent_broken`);
+        let failClosed;
+        try {
+            failClosed = await captureEvents(tenantId, failClosedEvt);
+        } finally {
+            await query(`ALTER TABLE current_consent_broken RENAME TO current_consent`);
+        }
+        testThat('consent lookup failure -> consent_check_unavailable',
+            !failClosed.ok && failClosed.code === 'consent_check_unavailable');
+        const failClosedPersisted = await query(
+            `SELECT count(*)::int AS n FROM events WHERE tenant_id = $1 AND event_id = $2`,
+            [tenantId, failClosedEvt.event_id]);
+        test('nothing persisted when consent could not be verified (fail-closed)',
+            failClosedPersisted.rows[0].n, 0);
 
     } finally {
         section('Teardown');

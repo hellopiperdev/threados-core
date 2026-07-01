@@ -19,6 +19,16 @@
 //                version event schemas.
 //   Decision 10: No PII in event properties - scan for email/phone/SSN and
 //                reject. PII has exactly one path into Core: the identity API.
+//   Decision 13: Multi-dimensional consent - capture implicates
+//                data_category='behavioral' with the purpose declared per
+//                event type in the registry (implicated_purpose).
+//   Decision 14: Tenant compliance postures - the tenant's posture selects
+//                which consent bases authorize which purposes (rule map in
+//                src/lib/enforcement.js).
+//   Decision 15: Write-time consent enforcement - identified events without
+//                valid consent for their purpose are rejected before storage,
+//                fail-closed; anonymous events go to the holding pattern
+//                (Decision 21, pending implementation).
 //   Decision 17: Critical path - persistence is synchronous; we return success
 //                only after events are durably written.
 //   Decision 20: Cookieless-first - device_fingerprint is a label captured with
@@ -28,6 +38,7 @@
 const { withTransaction } = require('./db');
 const { validateUuid, validateOptionalOpaqueId, validateRequiredString } = require('./validation');
 const { detectPiiInScalar, scanForPii } = require('./pii');
+const { evaluateCapture } = require('./enforcement');
 
 // ----------------------------------------------------------------------------
 // Limits
@@ -329,16 +340,16 @@ async function checkRegistry(client, tenantId, events) {
     const names = [...new Set(events.map(e => e.event_name))];
 
     const result = await client.query(
-        `SELECT event_name, event_category
+        `SELECT event_name, event_category, implicated_purpose
          FROM event_type_registry
          WHERE tenant_id = $1 AND event_name = ANY($2) AND is_active = true`,
         [tenantId, names]
     );
 
-    // Map of registered event_name -> its registered category.
+    // Map of registered event_name -> its registration row.
     const registered = new Map();
     for (const row of result.rows) {
-        registered.set(row.event_name, row.event_category);
+        registered.set(row.event_name, row);
     }
 
     const errors = [];
@@ -352,7 +363,7 @@ async function checkRegistry(client, tenantId, events) {
             });
             return;
         }
-        const registeredCategory = registered.get(evt.event_name);
+        const registeredCategory = registered.get(evt.event_name).event_category;
         if (registeredCategory !== evt.event_category) {
             errors.push({
                 field: 'event_category',
@@ -366,7 +377,14 @@ async function checkRegistry(client, tenantId, events) {
     if (errors.length > 0) {
         return { ok: false, errors };
     }
-    return { ok: true };
+
+    // The consent purpose each event type implicates (Bible Decision 13,
+    // migration 006), consumed by the consent check downstream.
+    const purposesByName = new Map();
+    for (const [name, row] of registered) {
+        purposesByName.set(name, row.implicated_purpose);
+    }
+    return { ok: true, purposesByName };
 }
 
 // ----------------------------------------------------------------------------
@@ -414,25 +432,118 @@ async function checkIdentities(client, tenantId, events) {
 }
 
 // ----------------------------------------------------------------------------
-// Consent snapshot placeholder (Bible Decision 15)
+// checkConsent (Bible Decisions 13, 14, 15)
 // ----------------------------------------------------------------------------
 //
-// The events table requires a non-null consent_snapshot, but write-time consent
-// enforcement is Step 7. Until the consent API exists we persist an explicit
-// "not evaluated" marker rather than a fake granted/denied decision, so that
-// when consent enforcement lands these events are clearly distinguishable as
-// pre-enforcement. This is deferred complexity, not a durable choice: Step 7
-// replaces this with a real snapshot.
+// Write-time consent enforcement. Per the settled Session 4 ruling, event
+// capture implicates data_category = 'behavioral' with the purpose declared
+// per event type in the registry; vendor/channel/jurisdiction are not
+// implicated at capture (they govern outbound use) and are evaluated with
+// DENY-PRECEDENCE across the matching current_consent rows instead. One
+// batched, indexed lookup (the projection's primary key leads with
+// tenant_id, identity_id) covers the whole request.
 //
-// TODO(Step 7 - consent): When write-time consent enforcement lands, this
-// placeholder must be (1) replaced with a real evaluated snapshot for new
-// events, AND (2) backfilled for the historical events written during Step 6.
-// Those rows are findable by consent_snapshot->>'status' = 'not_evaluated';
-// Step 7 must decide their disposition (re-evaluate against consent captured
-// later, quarantine, or expire) rather than silently leaving them unenforced.
+// Identified events are evaluated through the rule map
+// (src/lib/enforcement.js) under the tenant's compliance posture. Anonymous
+// events (no identity_id) have nothing to look consent up against; per
+// Decision 15's own text they belong to the 30-day holding pattern
+// (Decision 21, designed but not yet implemented), so they persist with an
+// explicit 'anonymous_holding' snapshot rather than being rejected.
+//
+// FAIL-CLOSED both ways: a rejected evaluation rejects the whole batch
+// (reject-all, Decision 7), and an infrastructure failure during the lookup
+// throws an error tagged consentCheckFailure - captureEvents converts it to
+// consent_check_unavailable so the route can answer 503 honestly ("we could
+// not verify consent") instead of silently capturing unverified events.
+//
+// Returns { ok: true, snapshots } (snapshots[i] belongs to events[i]) or
+// { ok: false, errors }.
 // ----------------------------------------------------------------------------
 
-const CONSENT_NOT_EVALUATED = { status: 'not_evaluated', reason: 'consent_enforcement_pending_step_7' };
+const ANONYMOUS_HOLDING_REASON = 'pre_identification_holding_pending_decision_21';
+
+async function checkConsent(client, tenantId, posture, events, purposesByName) {
+    const identified = events.filter(e => e.identity_id);
+    const ids = [...new Set(identified.map(e => e.identity_id))];
+    const purposes = [...new Set(identified.map(e => purposesByName.get(e.event_name)))];
+
+    let rows = [];
+    if (ids.length > 0) {
+        try {
+            const result = await client.query(
+                `SELECT identity_id, purpose, state, consent_basis, effective_from, source_record_id
+                 FROM current_consent
+                 WHERE tenant_id = $1 AND identity_id = ANY($2)
+                   AND purpose = ANY($3) AND data_category = 'behavioral'`,
+                [tenantId, ids, purposes]
+            );
+            rows = result.rows;
+        } catch (err) {
+            // The consent lookup itself failed. Mark the error so the caller
+            // fails closed with an honest code instead of a generic 500.
+            err.consentCheckFailure = true;
+            throw err;
+        }
+    }
+
+    // Group rows by (identity, purpose); vendor/channel/jurisdiction vary
+    // within each group and are handled by evaluateCapture's deny-precedence.
+    const rowsByKey = new Map();
+    for (const row of rows) {
+        const key = `${row.identity_id}|${row.purpose}`;
+        if (!rowsByKey.has(key)) rowsByKey.set(key, []);
+        rowsByKey.get(key).push({
+            state: row.state,
+            consent_basis: row.consent_basis,
+            effective_from: row.effective_from,
+            record_id: row.source_record_id,
+        });
+    }
+
+    const errors = [];
+    const snapshots = [];
+    const evaluatedAt = new Date().toISOString();
+
+    events.forEach((evt, index) => {
+        if (!evt.identity_id) {
+            snapshots.push({
+                status: 'anonymous_holding',
+                reason: ANONYMOUS_HOLDING_REASON,
+                evaluated_at: evaluatedAt,
+            });
+            return;
+        }
+
+        const purpose = purposesByName.get(evt.event_name);
+        const matched = rowsByKey.get(`${evt.identity_id}|${purpose}`) || [];
+        const decision = evaluateCapture(matched, posture, purpose);
+
+        if (!decision.allowed) {
+            errors.push({
+                field: 'event',
+                code: 'consent_denied',
+                message: `event capture requires consent for purpose "${purpose}" over behavioral data (${decision.reason})`,
+                index,
+            });
+            snapshots.push(null);
+            return;
+        }
+
+        snapshots.push({
+            status: 'granted',
+            posture,
+            purpose,
+            basis: decision.basis,
+            source_record_id: decision.record_id,
+            evaluated_at: evaluatedAt,
+        });
+    });
+
+    if (errors.length > 0) {
+        return { ok: false, errors };
+    }
+    return { ok: true, snapshots };
+}
 
 // ----------------------------------------------------------------------------
 // persistEvents
@@ -452,10 +563,16 @@ const CONSENT_NOT_EVALUATED = { status: 'not_evaluated', reason: 'consent_enforc
 // where `id` is Core's generated primary key for newly created events.
 // ----------------------------------------------------------------------------
 
-async function persistEvents(client, tenantId, events) {
+async function persistEvents(client, tenantId, events, snapshots) {
+    if (!snapshots || snapshots.length !== events.length) {
+        // Persisting without an evaluated snapshot would silently recreate the
+        // pre-Step-7 unenforced state - refuse loudly.
+        throw new Error('persistEvents requires one consent snapshot per event');
+    }
+
     const results = [];
 
-    for (const evt of events) {
+    for (const [i, evt] of events.entries()) {
         const insert = await client.query(
             `INSERT INTO events (
                 tenant_id, event_id, identity_id, session_id, device_fingerprint,
@@ -476,7 +593,7 @@ async function persistEvents(client, tenantId, events) {
                 evt.event_name,
                 evt.event_category,
                 evt.properties,
-                CONSENT_NOT_EVALUATED,
+                snapshots[i],
                 evt.event_timestamp,
             ]
         );
@@ -498,11 +615,17 @@ async function persistEvents(client, tenantId, events) {
 // The orchestrator the HTTP layer calls. Given a verified tenantId and the raw
 // request body, it runs the full pipeline:
 //   1. Validate + normalize (shape, identifiers, PII)
-//   2. In one transaction: registry check, identity existence check, persist
+//   2. In one transaction: registry check, identity existence check, consent
+//      enforcement (Bible Decision 15), persist with evaluated snapshots
 //
-// On a validation/registry/identity failure it returns a rejection WITHOUT
-// touching the database (or rolling back), so the whole batch is rejected
-// atomically (Bible Decision 7: reject-all, no partial accept).
+// On a validation/registry/identity/consent failure it returns a rejection
+// WITHOUT persisting anything, so the whole batch is rejected atomically
+// (Bible Decision 7: reject-all, no partial accept).
+//
+// If the consent lookup itself fails (infrastructure), the transaction rolls
+// back and the rejection code is consent_check_unavailable: fail-closed (no
+// unverified event is stored) and fail-honest (the response says the consent
+// check was what failed, and that a retry is appropriate).
 //
 // Returns:
 //   { ok: true, results: [...], created, duplicates }
@@ -525,41 +648,65 @@ async function captureEvents(tenantId, body) {
 
     const events = validation.value;
 
-    return await withTransaction(async (client) => {
-        // Confirm the tenant exists. Without this, a valid JWT for a tenant that
-        // doesn't exist would fail later as "unregistered_event" (its registry
-        // is empty), which misdescribes the real problem. Mirrors the identity
-        // route's tenant_not_found behavior.
-        const tenantRes = await client.query(
-            `SELECT 1 FROM tenants WHERE id = $1 LIMIT 1`,
-            [tenantId]
-        );
-        if (tenantRes.rows.length === 0) {
+    try {
+        return await withTransaction(async (client) => {
+            // Confirm the tenant exists and learn its compliance posture
+            // (Decision 14) in one lookup. Without the existence check, a valid
+            // JWT for a tenant that doesn't exist would fail later as
+            // "unregistered_event" (its registry is empty), which misdescribes
+            // the real problem. Mirrors the identity route's tenant_not_found.
+            const tenantRes = await client.query(
+                `SELECT compliance_posture FROM tenants WHERE id = $1 LIMIT 1`,
+                [tenantId]
+            );
+            if (tenantRes.rows.length === 0) {
+                return {
+                    ok: false,
+                    code: 'tenant_not_found',
+                    errors: [{ field: 'tenant', code: 'tenant_not_found', message: 'the specified tenant does not exist' }],
+                };
+            }
+            const posture = tenantRes.rows[0].compliance_posture;
+
+            const registryCheck = await checkRegistry(client, tenantId, events);
+            if (!registryCheck.ok) {
+                // Returning (not throwing) commits an empty transaction, which is
+                // fine - nothing was written. Reject-all: no events persisted.
+                return { ok: false, code: 'unregistered_event', errors: registryCheck.errors };
+            }
+
+            const identityCheck = await checkIdentities(client, tenantId, events);
+            if (!identityCheck.ok) {
+                return { ok: false, code: 'identity_not_found', errors: identityCheck.errors };
+            }
+
+            const consentCheck = await checkConsent(
+                client, tenantId, posture, events, registryCheck.purposesByName);
+            if (!consentCheck.ok) {
+                return { ok: false, code: 'consent_denied', errors: consentCheck.errors };
+            }
+
+            const results = await persistEvents(client, tenantId, events, consentCheck.snapshots);
+            const created = results.filter(r => r.status === 'created').length;
+            const duplicates = results.filter(r => r.status === 'duplicate').length;
+
+            return { ok: true, results, created, duplicates };
+        });
+    } catch (err) {
+        if (err.consentCheckFailure) {
+            // The transaction rolled back; nothing was persisted (fail-closed).
             return {
                 ok: false,
-                code: 'tenant_not_found',
-                errors: [{ field: 'tenant', code: 'tenant_not_found', message: 'the specified tenant does not exist' }],
+                code: 'consent_check_unavailable',
+                errors: [{
+                    field: 'consent',
+                    code: 'consent_check_unavailable',
+                    message: 'consent could not be verified; events were not captured (fail-closed), please retry',
+                }],
             };
         }
-
-        const registryCheck = await checkRegistry(client, tenantId, events);
-        if (!registryCheck.ok) {
-            // Returning (not throwing) commits an empty transaction, which is
-            // fine - nothing was written. Reject-all: no events persisted.
-            return { ok: false, code: 'unregistered_event', errors: registryCheck.errors };
-        }
-
-        const identityCheck = await checkIdentities(client, tenantId, events);
-        if (!identityCheck.ok) {
-            return { ok: false, code: 'identity_not_found', errors: identityCheck.errors };
-        }
-
-        const results = await persistEvents(client, tenantId, events);
-        const created = results.filter(r => r.status === 'created').length;
-        const duplicates = results.filter(r => r.status === 'duplicate').length;
-
-        return { ok: true, results, created, duplicates };
-    });
+        throw err;
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -574,7 +721,8 @@ module.exports = {
     validateEventsRequest,
     checkRegistry,
     checkIdentities,
+    checkConsent,
     persistEvents,
     captureEvents,
-    CONSENT_NOT_EVALUATED,
+    ANONYMOUS_HOLDING_REASON,
 };

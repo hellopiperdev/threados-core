@@ -510,7 +510,15 @@ CREATE TABLE IF NOT EXISTS event_type_registry (
     
     event_name VARCHAR(100) NOT NULL,
     event_category VARCHAR(50) NOT NULL,
-    
+
+    -- The consent purpose this event type implicates for write-time
+    -- enforcement (Bible Decisions 13/14/15; mirrors migration 006). Declared
+    -- by the vertical at registration. Defaults to 'analytics' - the most
+    -- consent-gated capture purpose - so undeclared event types fail closed.
+    implicated_purpose VARCHAR(30) NOT NULL DEFAULT 'analytics'
+        CHECK (implicated_purpose IN ('marketing', 'personalization', 'analytics',
+                                      'service_operations', 'legal_compliance', 'fraud_prevention')),
+
     -- JSON Schema defining valid properties for this event type
     properties_schema JSONB NOT NULL DEFAULT '{}',
     
@@ -796,7 +804,8 @@ INSERT INTO schema_migrations (version, description) VALUES
     ('002_registered_verticals', 'Add registered_verticals table for JWT vertical registration'),
     ('003_event_capture', 'Add event_id idempotency key + device_fingerprint, make session_id nullable for event capture'),
     ('004_session_id_opaque', 'Retype events.session_id from UUID to VARCHAR(200): session_id is an opaque external identifier, not a Core-owned UUID'),
-    ('005_consent_data_model', 'Replace placeholder consent_records with bitemporal append-only consent history + current_consent projection (Step 7 Session 1)')
+    ('005_consent_data_model', 'Replace placeholder consent_records with bitemporal append-only consent history + current_consent projection (Step 7 Session 1)'),
+    ('006_event_type_implicated_purpose', 'Add implicated_purpose to event_type_registry: event types declare the consent purpose they implicate for write-time enforcement (Step 7 Session 4)')
 ON CONFLICT (version) DO NOTHING;
 
 

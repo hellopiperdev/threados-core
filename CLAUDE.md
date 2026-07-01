@@ -232,15 +232,15 @@ Phase B in progress:
         Session 1 ✓ data model (consent_records history + current_consent projection)
         Session 2 ✓ recording API (POST /api/v1/consent, projection maintenance)
         Session 3 ✓ read API (GET /api/v1/consent/:identity_id, history pagination)
-        Remaining: write-time enforcement in event capture + Step 6 backfill
+        Session 4 ✓ write-time enforcement (rule map, 403/503) + Step 6 backfill
   [ ] Step 8: Audit logging pipeline
   [ ] Step 9: Loyalty wallet
   [ ] Step 10: Production deployment to GCP
 ```
 
-Total tests passing: 806. Latest commit on `main` at time of writing: `0478835`.
+Total tests passing: 887. Latest commit on `main` at time of writing: `78be8f9`.
 
-Step 7's remaining work must backfill `consent_snapshot` values for events captured in Step 6 (findable via `consent_snapshot->>'status' = 'not_evaluated'`).
+The Step 6 consent-snapshot backfill is implemented as `scripts/backfill-consent-snapshots.js` (idempotent, `--dry-run` supported); run it against any environment still holding `consent_snapshot->>'status' = 'not_evaluated'` rows.
 
 ---
 
@@ -250,7 +250,6 @@ Real tracked technical debt lives in ClickUp under "Piper Consulting Co → Thre
 
 Categories of deferred work that affect Step 6+:
 
-- **Consent enforcement in event capture** — Bible Decision 15. Wire in when consent API exists in Step 7.
 - **Field-level event property schema validation** — Bible Decision 8. Currently accept properties as a typed JSONB blob without per-schema validation.
 - **Anonymous event holding pattern** — Bible Decision 21. Dual-track 30-day individual + permanent aggregate. Designed but not yet implemented.
 - **Row Level Security policies in PostgreSQL** — defense in depth on top of application-level tenant filtering. Before production.

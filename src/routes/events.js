@@ -70,9 +70,21 @@ function requireJsonContent(req, res, next) {
 //        is well-formed; what it points at is the problem.
 //                          -> unregistered_event, identity_not_found (+ mismatch)
 //
+//   403  Consent enforcement (Bible Decision 15). The request is well-formed
+//        and everything it references exists - the customer has not consented
+//        (no record, explicit denial/withdrawal, or a basis the tenant's
+//        posture doesn't accept for the purpose). Not 422: nothing is
+//        missing; the operation is FORBIDDEN.        -> consent_denied
+//
+//   503  Consent could not be VERIFIED (infrastructure failure during the
+//        consent lookup). Fail-closed: nothing was stored. Fail-honest: the
+//        code says the consent check failed and a retry is appropriate.
+//                                            -> consent_check_unavailable
+//
 // In short: 404 == "the tenant in your token is gone", 422 == "your well-formed
-// request references something else that isn't there / isn't allowed", 400 ==
-// "your payload is malformed". Keep new rejection codes on this rule.
+// request references something else that isn't there / isn't allowed", 403 ==
+// "consent forbids this", 400 == "your payload is malformed". Keep new
+// rejection codes on this rule.
 // ----------------------------------------------------------------------------
 
 function statusForRejection(code) {
@@ -82,6 +94,10 @@ function statusForRejection(code) {
         case 'unregistered_event':
         case 'identity_not_found':
             return 422;
+        case 'consent_denied':
+            return 403;
+        case 'consent_check_unavailable':
+            return 503;
         case 'validation_failed':
         case 'invalid_body_type':
         default:
