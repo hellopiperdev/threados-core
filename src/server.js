@@ -10,6 +10,7 @@
 const express = require('express');
 const identityRoutes = require('./routes/identity');
 const eventRoutes = require('./routes/events');
+const consentRoutes = require('./routes/consent');
 const wellKnownRoutes = require('./routes/wellKnown');
 
 function createServer() {
@@ -86,6 +87,12 @@ function createServer() {
     // ------------------------------------------------------------------------
 
     app.use('/api/v1/events', eventRoutes);
+
+    // ------------------------------------------------------------------------
+    // Consent routes
+    // ------------------------------------------------------------------------
+
+    app.use('/api/v1/consent', consentRoutes);
 
     // ------------------------------------------------------------------------
     // JSON parse error handler

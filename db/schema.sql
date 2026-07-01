@@ -779,8 +779,24 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
     applied_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-INSERT INTO schema_migrations (version, description) 
+INSERT INTO schema_migrations (version, description)
 VALUES ('001_initial_core_schema', 'Initial ThreadOS Core schema: tenants, identities, consent, events, customers, loyalty, integrations')
+ON CONFLICT (version) DO NOTHING;
+
+-- This file is kept current: it embodies the END STATE of every migration in
+-- db/migrations.sql (e.g. Section 5 mirrors migration 005's consent model,
+-- Section 6 carries migration 003/004's event columns). A database built from
+-- schema.sql alone must therefore record those migrations too - otherwise the
+-- two build paths (schema.sql alone; schema.sql + migrations.sql via
+-- db/migrate.js) produce identical schemas but disagree about what has been
+-- applied. Descriptions match migrations.sql verbatim; ON CONFLICT keeps both
+-- paths idempotent. When adding a migration, add its record here in the same
+-- change that folds its end state into this file.
+INSERT INTO schema_migrations (version, description) VALUES
+    ('002_registered_verticals', 'Add registered_verticals table for JWT vertical registration'),
+    ('003_event_capture', 'Add event_id idempotency key + device_fingerprint, make session_id nullable for event capture'),
+    ('004_session_id_opaque', 'Retype events.session_id from UUID to VARCHAR(200): session_id is an opaque external identifier, not a Core-owned UUID'),
+    ('005_consent_data_model', 'Replace placeholder consent_records with bitemporal append-only consent history + current_consent projection (Step 7 Session 1)')
 ON CONFLICT (version) DO NOTHING;
 
 

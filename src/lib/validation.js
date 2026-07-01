@@ -183,6 +183,40 @@ function validateName(value, fieldName = 'name') {
     return { valid: true, value: trimmed };
 }
 
+// Required, non-empty, length-bounded string. The workhorse for free-text
+// fields that must be present (event names, consent capture context, etc.).
+// Trims surrounding whitespace; the trimmed value is what gets stored.
+// (Originally a local helper in src/lib/events.js; lifted here in Step 7
+// Session 2 when the consent module became its second caller.)
+function validateRequiredString(value, fieldName, maxLength) {
+    if (value === undefined || value === null) {
+        return {
+            valid: false,
+            error: { field: fieldName, code: 'missing', message: `${fieldName} is required` },
+        };
+    }
+    if (typeof value !== 'string') {
+        return {
+            valid: false,
+            error: { field: fieldName, code: 'invalid_type', message: `${fieldName} must be a string` },
+        };
+    }
+    const trimmed = value.trim();
+    if (trimmed === '') {
+        return {
+            valid: false,
+            error: { field: fieldName, code: 'missing', message: `${fieldName} must not be empty` },
+        };
+    }
+    if (trimmed.length > maxLength) {
+        return {
+            valid: false,
+            error: { field: fieldName, code: 'too_long', message: `${fieldName} must be ${maxLength} characters or fewer` },
+        };
+    }
+    return { valid: true, value: trimmed };
+}
+
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function validateUuid(value, fieldName) {
@@ -353,6 +387,7 @@ module.exports = {
     validateEmail,
     validatePhone,
     validateName,
+    validateRequiredString,
     validateUuid,
     validateOptionalOpaqueId,
     validateIdentityHashRequest,

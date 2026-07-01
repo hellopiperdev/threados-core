@@ -228,15 +228,18 @@ Phase A: COMPLETE (Steps 1-4)
 Phase B in progress:
   [✓] Step 5: JWT authentication (5 sessions + prerequisite)
   [✓] Step 6: Event capture API (3 sessions)
-  [ ] Step 7: Consent management
+  [~] Step 7: Consent management
+        Session 1 ✓ data model (consent_records history + current_consent projection)
+        Session 2 ✓ recording API (POST /api/v1/consent, projection maintenance)
+        Remaining: write-time enforcement in event capture + Step 6 backfill
   [ ] Step 8: Audit logging pipeline
   [ ] Step 9: Loyalty wallet
   [ ] Step 10: Production deployment to GCP
 ```
 
-Total tests passing: 453. Latest commit on `main` at time of writing: `a2a2249`.
+Total tests passing: 729. Latest commit on `main` at time of writing: `02093e2`.
 
-Step 7 (consent management) is next; it must backfill `consent_snapshot` values for events captured in Step 6 (findable via `consent_snapshot->>'status' = 'not_evaluated'`).
+Step 7's remaining work must backfill `consent_snapshot` values for events captured in Step 6 (findable via `consent_snapshot->>'status' = 'not_evaluated'`).
 
 ---
 
