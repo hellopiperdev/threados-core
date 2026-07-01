@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node src/index.js",
     "migrate": "node db/migrate.js",
-    "test": "node tests/lib/hashing.test.js && node tests/lib/identity.test.js && node tests/lib/events.test.js && node tests/lib/jwks.test.js && node tests/lib/jwt.test.js && node tests/middleware/auth.test.js && node tests/middleware/auth-robustness.test.js && node tests/routes/identity.test.js && node tests/routes/events.test.js && node tests/routes/robustness.test.js && node tests/scripts/generate-keys.test.js",
+    "test": "node tests/lib/hashing.test.js && node tests/lib/identity.test.js && node tests/lib/events.test.js && node tests/lib/jwks.test.js && node tests/lib/jwt.test.js && node tests/middleware/auth.test.js && node tests/middleware/auth-robustness.test.js && node tests/routes/identity.test.js && node tests/routes/events.test.js && node tests/routes/robustness.test.js && node tests/scripts/generate-keys.test.js && node tests/db/consent-schema.test.js",
     "test:hashing": "node tests/lib/hashing.test.js",
     "test:identity": "node tests/lib/identity.test.js",
     "test:events-lib": "node tests/lib/events.test.js",
@@ -17,7 +17,8 @@
     "test:routes": "node tests/routes/identity.test.js",
     "test:events": "node tests/routes/events.test.js",
     "test:robustness": "node tests/routes/robustness.test.js",
-    "test:keygen": "node tests/scripts/generate-keys.test.js"
+    "test:keygen": "node tests/scripts/generate-keys.test.js",
+    "test:consent-schema": "node tests/db/consent-schema.test.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",

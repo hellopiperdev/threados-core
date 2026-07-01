@@ -335,70 +335,160 @@ COMMENT ON TABLE identities IS
 -- ============================================================================
 -- SECTION 5: Consent
 -- Bible: Decision 13 (multi-dimensional), Decision 14 (compliance postures),
---        Decision 15 (write-time enforcement)
+--        Decision 15 (write-time enforcement), Decision 7 (gatekeeper)
 -- ============================================================================
 
 -- ----------------------------------------------------------------------------
--- consent_records: Multi-dimensional consent tracking
+-- consent_records: Append-only bitemporal consent history
 --
--- Each row captures consent for a specific (identity, purpose) combination
--- with full audit metadata.
+-- Each row records one consent decision, fully specified across all five
+-- dimensions (Bible Decision 13). Practical bitemporal: effective_from /
+-- effective_until are VALID time (when the decision is in force; NULL
+-- effective_until = currently in effect), recorded_at is SYSTEM time (when
+-- Core learned of it). Rows are never UPDATEd - a consent change is a new
+-- INSERT that supersedes the old row. Append-only is an application-level
+-- convention (the write path is INSERT-only by construction), not a DB
+-- trigger: the tenant/identity FKs must cascade deletions for the
+-- right-to-erasure workflow (Bible Decision 6).
+--
+-- state records what the customer decided (granted / denied / withdrawn -
+-- withdrawn means a prior grant was revoked, denied means they never agreed).
+-- consent_basis records the epistemic status of our knowledge of that decision
+-- (the per-record half of Bible Decision 14; the tenant-level half is
+-- tenants.compliance_posture). They are orthogonal: an imported legacy record
+-- may be state=granted, consent_basis=undocumented.
+--
+-- vendor is an opaque external identifier (Core bounds length, nothing else -
+-- same rule as events.session_id). jurisdiction is an ISO 3166-1 alpha-2
+-- country or subdivision code ('US', 'US-CA'); format is validated at the
+-- application layer. capture_context and reason are vertical-provided free
+-- text stored verbatim (no raw PII - scanned at the application layer).
+--
+-- No record means NO consent - the strictest, framework-agnostic default.
 -- ----------------------------------------------------------------------------
+
+-- Reconciliation guard (mirrors migration 005): databases built before Step 7
+-- carry the placeholder consent_records from the original schema, which the
+-- CREATE ... IF NOT EXISTS below would silently leave in place - and the index
+-- on recorded_at would then fail. Only the placeholder has a `granted` boolean
+-- column (this design uses `state`), so the guard can never match the current
+-- table. The placeholder was never written to by any code path.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'consent_records'
+          AND column_name = 'granted'
+    ) THEN
+        DROP TABLE consent_records;
+    END IF;
+END $$;
+
 CREATE TABLE IF NOT EXISTS consent_records (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    record_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     identity_id UUID NOT NULL REFERENCES identities(id) ON DELETE CASCADE,
-    
-    -- Multi-dimensional consent attributes (Bible Decision 13)
-    purpose VARCHAR(100) NOT NULL,
-    vendor VARCHAR(100),  -- NULL means "any vendor"
-    channel VARCHAR(50),  -- email, sms, phone, mail, push, web, etc. NULL means "any"
-    data_category VARCHAR(50) NOT NULL DEFAULT 'standard',
-    jurisdiction VARCHAR(20),  -- 'gdpr', 'ccpa', 'tcpa', etc.
-    
-    -- The consent itself
-    granted BOOLEAN NOT NULL,
-    
-    -- How consent was captured (Bible: legal defensibility)
-    consent_basis VARCHAR(50) NOT NULL DEFAULT 'active_consent'
-        CHECK (consent_basis IN (
-            'active_consent',           -- User explicitly consented
-            'legitimate_interest',      -- Legal basis for operational use
-            'contractual_necessity',    -- Required to fulfill contract
-            'legal_obligation',         -- Required by law
-            'undocumented',             -- Legacy data; needs re-verification
-            'withdrawn'                 -- Previously granted, now revoked
-        )),
-    
-    -- Capture audit trail (Bible Decision 13)
-    captured_via VARCHAR(50) NOT NULL,  -- 'web_form', 'phone_call', 'import', etc.
-    capture_context JSONB,  -- IP, user agent, form name, etc. (with no raw PII)
-    
-    -- IAB TCF compliance fields (when applicable)
-    tcf_version VARCHAR(10),
-    tcf_string TEXT,
-    
-    -- Lifecycle
-    valid_from TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    valid_until TIMESTAMP WITH TIME ZONE,
-    superseded_by UUID REFERENCES consent_records(id),
-    
-    -- Timestamps
-    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+
+    -- Consent dimensions (Bible Decision 13). All NOT NULL: a record fully
+    -- specifies every dimension; a decision spanning multiple channels or
+    -- purposes is recorded as multiple rows.
+    purpose VARCHAR(30) NOT NULL
+        CHECK (purpose IN ('marketing', 'personalization', 'analytics',
+                           'service_operations', 'legal_compliance', 'fraud_prevention')),
+    vendor VARCHAR(200) NOT NULL,
+    channel VARCHAR(20) NOT NULL
+        CHECK (channel IN ('email', 'sms', 'voice', 'push', 'mail', 'in_app')),
+    data_category VARCHAR(20) NOT NULL
+        CHECK (data_category IN ('behavioral', 'pii', 'location', 'financial', 'health')),
+    jurisdiction VARCHAR(10) NOT NULL,
+
+    -- What the customer decided
+    state VARCHAR(20) NOT NULL
+        CHECK (state IN ('granted', 'denied', 'withdrawn')),
+
+    -- Epistemic status of our knowledge of that decision (Bible Decision 14)
+    consent_basis VARCHAR(20) NOT NULL
+        CHECK (consent_basis IN ('active_consent', 'documented_opt_in', 'legitimate_interest',
+                                 'contract', 'legal_obligation', 'undocumented')),
+
+    -- How the decision was captured
+    captured_via VARCHAR(30) NOT NULL
+        CHECK (captured_via IN ('web_form', 'email_response', 'phone', 'in_person',
+                                'imported', 'api_direct', 'paper_form')),
+    capture_context TEXT NOT NULL CHECK (length(capture_context) <= 2000),
+    reason TEXT NOT NULL CHECK (length(reason) <= 2000),
+
+    -- Practical bitemporal: valid time (effective_*) + system time (recorded_at)
+    effective_from TIMESTAMP WITH TIME ZONE NOT NULL,
+    effective_until TIMESTAMP WITH TIME ZONE,
+    recorded_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CHECK (effective_until IS NULL OR effective_until > effective_from)
 );
 
-CREATE INDEX IF NOT EXISTS consent_identity ON consent_records (identity_id, valid_from DESC);
-CREATE INDEX IF NOT EXISTS consent_tenant_identity_purpose 
-    ON consent_records (tenant_id, identity_id, purpose);
+-- Temporal history reads: consent history and point-in-time reconstruction
+-- both scan by (tenant, identity) ordered by system time.
+CREATE INDEX IF NOT EXISTS consent_records_tenant_identity_recorded
+    ON consent_records (tenant_id, identity_id, recorded_at DESC);
 
-DROP TRIGGER IF EXISTS consent_records_update_timestamp ON consent_records;
-CREATE TRIGGER consent_records_update_timestamp
-    BEFORE UPDATE ON consent_records
+COMMENT ON TABLE consent_records IS
+    'Append-only bitemporal consent history. Never UPDATEd; supersession is a new INSERT. Bible Decisions 13, 14, 15.';
+
+
+-- ----------------------------------------------------------------------------
+-- current_consent: Projection of currently-effective consent
+--
+-- One row per (tenant, identity, purpose, vendor, channel, data_category,
+-- jurisdiction) tuple holding what is currently in effect. Maintained
+-- synchronously in the same transaction as consent_records inserts, so the
+-- projection can never disagree with the history. Write-time consent
+-- enforcement (Bible Decision 15) reads this table with a single indexed
+-- lookup inside the event-capture transaction.
+--
+-- The composite primary key IS the uniqueness guarantee and, via its leading
+-- columns (tenant_id, identity_id), the index for the "what's this customer's
+-- full consent state?" query.
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS current_consent (
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    identity_id UUID NOT NULL REFERENCES identities(id) ON DELETE CASCADE,
+
+    purpose VARCHAR(30) NOT NULL
+        CHECK (purpose IN ('marketing', 'personalization', 'analytics',
+                           'service_operations', 'legal_compliance', 'fraud_prevention')),
+    vendor VARCHAR(200) NOT NULL,
+    channel VARCHAR(20) NOT NULL
+        CHECK (channel IN ('email', 'sms', 'voice', 'push', 'mail', 'in_app')),
+    data_category VARCHAR(20) NOT NULL
+        CHECK (data_category IN ('behavioral', 'pii', 'location', 'financial', 'health')),
+    jurisdiction VARCHAR(10) NOT NULL,
+
+    state VARCHAR(20) NOT NULL
+        CHECK (state IN ('granted', 'denied', 'withdrawn')),
+    consent_basis VARCHAR(20) NOT NULL
+        CHECK (consent_basis IN ('active_consent', 'documented_opt_in', 'legitimate_interest',
+                                 'contract', 'legal_obligation', 'undocumented')),
+
+    effective_from TIMESTAMP WITH TIME ZONE NOT NULL,
+
+    -- The consent_records row that produced this current state. No cascade
+    -- action: history rows are never deleted independently of their identity,
+    -- and this FK makes a stray direct DELETE on consent_records fail loudly.
+    source_record_id UUID NOT NULL REFERENCES consent_records(record_id),
+
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    -- One current-state row per dimension tuple
+    PRIMARY KEY (tenant_id, identity_id, purpose, vendor, channel, data_category, jurisdiction)
+);
+
+DROP TRIGGER IF EXISTS current_consent_update_timestamp ON current_consent;
+CREATE TRIGGER current_consent_update_timestamp
+    BEFORE UPDATE ON current_consent
     FOR EACH ROW EXECUTE FUNCTION update_updated_at();
 
-COMMENT ON TABLE consent_records IS 
-    'Multi-dimensional consent tracking with audit trail. Bible Decisions 13, 14, 15.';
+COMMENT ON TABLE current_consent IS
+    'Denormalized projection of currently-effective consent, one row per dimension tuple. Maintained in the same transaction as consent_records inserts. Bible Decision 15.';
 
 
 -- ============================================================================
