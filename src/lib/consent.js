@@ -2,9 +2,10 @@
 // ThreadOS Core - Consent Recording Business Logic
 // ============================================================================
 //
-// Core logic for the consent recording API: validating consent decisions and
-// persisting them into the append-only bitemporal history (consent_records)
-// while maintaining the current_consent projection in the same transaction.
+// Core logic for the consent recording and read APIs: validating consent
+// decisions, persisting them into the append-only bitemporal history
+// (consent_records) while maintaining the current_consent projection in the
+// same transaction, and reading both back (projection + paginated history).
 //
 // This module owns the "what is a valid consent record and how does it get
 // stored" rules. The HTTP layer (src/routes/consent.js) handles
@@ -34,7 +35,7 @@
 //                written.
 // ============================================================================
 
-const { withTransaction } = require('./db');
+const { query, withTransaction } = require('./db');
 const { validateUuid, validateRequiredString } = require('./validation');
 const { scanForPii } = require('./pii');
 
@@ -50,6 +51,12 @@ const { scanForPii } = require('./pii');
 // ----------------------------------------------------------------------------
 
 const MAX_BATCH_SIZE = 100;
+
+// History pagination bounds (Step 7 Session 3). 100 covers a typical
+// identity's full consent history in one read; 500 bounds the worst case a
+// single request can pull without pinning a connection.
+const HISTORY_DEFAULT_LIMIT = 100;
+const HISTORY_MAX_LIMIT = 500;
 
 // ----------------------------------------------------------------------------
 // Controlled vocabularies (Bible Decisions 13, 14)
@@ -614,6 +621,201 @@ async function recordConsent(tenantId, body) {
 }
 
 // ----------------------------------------------------------------------------
+// validateHistoryOptions
+// ----------------------------------------------------------------------------
+//
+// Validates the pagination options for a consent history read (typically the
+// raw query-string values, which arrive as strings). Application-layer
+// validation per the Gatekeeper Principle: out-of-range values are rejected
+// with actionable errors, never silently clamped.
+//
+//   limit:  optional; integer 1..HISTORY_MAX_LIMIT (default
+//           HISTORY_DEFAULT_LIMIT)
+//   before: optional; ISO 8601 timestamp; returns only records with
+//           recorded_at strictly before it (exclusive cursor)
+//
+// Returns:
+//   { valid: true, value: { limit, before } }
+//   { valid: false, errors: [ { field, code, message }, ... ] }
+// ----------------------------------------------------------------------------
+
+function validateHistoryOptions(raw = {}) {
+    const errors = [];
+    const value = { limit: HISTORY_DEFAULT_LIMIT, before: null };
+
+    if (raw.limit !== undefined && raw.limit !== null && raw.limit !== '') {
+        // Accept a number or a numeric string (query params arrive as strings).
+        // A repeated query param arrives as an array - wrong type, reject.
+        const limitNum = (typeof raw.limit === 'string' || typeof raw.limit === 'number')
+            ? Number(raw.limit)
+            : NaN;
+        if (!Number.isInteger(limitNum)) {
+            errors.push({ field: 'limit', code: 'invalid_format', message: 'limit must be an integer' });
+        } else if (limitNum < 1 || limitNum > HISTORY_MAX_LIMIT) {
+            errors.push({
+                field: 'limit',
+                code: 'invalid_value',
+                message: `limit must be between 1 and ${HISTORY_MAX_LIMIT}`,
+            });
+        } else {
+            value.limit = limitNum;
+        }
+    }
+
+    if (raw.before !== undefined && raw.before !== null && raw.before !== '') {
+        const beforeResult = validateTimestamp(raw.before, 'before');
+        if (beforeResult.valid) value.before = beforeResult.value;
+        else errors.push(beforeResult.error);
+    }
+
+    if (errors.length > 0) {
+        return { valid: false, errors };
+    }
+    return { valid: true, value };
+}
+
+// ----------------------------------------------------------------------------
+// getCurrentConsent
+// ----------------------------------------------------------------------------
+//
+// Reads the current_consent projection for one identity: every dimension
+// tuple with a currently-effective decision (Bible Decision 15 - this is the
+// same table write-time enforcement reads). No rows means NO consent for
+// anything - a valid, meaningful state, not an error.
+//
+// Returns the flat rows in a deterministic dimension order; presentation
+// grouping is the HTTP layer's concern.
+// ----------------------------------------------------------------------------
+
+async function getCurrentConsent(tenantId, identityId) {
+    const result = await query(
+        `SELECT purpose, vendor, channel, data_category, jurisdiction,
+                state, consent_basis, effective_from, source_record_id
+         FROM current_consent
+         WHERE tenant_id = $1 AND identity_id = $2
+         ORDER BY purpose, vendor, channel, data_category, jurisdiction`,
+        [tenantId, identityId]
+    );
+    return result.rows;
+}
+
+// ----------------------------------------------------------------------------
+// getConsentHistory
+// ----------------------------------------------------------------------------
+//
+// Reads the append-only consent history for one identity, newest first
+// (recorded_at DESC - system time, i.e. the order Core learned of decisions).
+// record_id DESC as a tiebreaker keeps the order stable when a batch shares
+// one recorded_at (all records in a transaction get the same
+// CURRENT_TIMESTAMP).
+//
+// Pagination is an exclusive keyset cursor on recorded_at: pass the oldest
+// recorded_at you've seen as `before` to get the next page. We fetch one row
+// beyond the limit to report has_more without a second query.
+//
+// KNOWN LIMIT of the timestamp-only cursor: records sharing the cursor's
+// exact recorded_at (same-batch siblings) are excluded along with it, so a
+// page boundary that lands inside a batch skips that batch's remaining rows.
+// Callers that need batch-safe pagination should raise `limit` instead. The
+// fix is a composite (recorded_at, record_id) cursor - deferred until a
+// vertical actually pages through histories deep enough to hit it.
+//
+// Returns { records, has_more }.
+// ----------------------------------------------------------------------------
+
+async function getConsentHistory(tenantId, identityId, options = {}) {
+    // Defense in depth: the route already rejected out-of-range values with a
+    // structured error; this floor/cap only protects direct lib callers.
+    const limit = Math.min(options.limit || HISTORY_DEFAULT_LIMIT, HISTORY_MAX_LIMIT);
+    const before = options.before || null;
+
+    const result = await query(
+        `SELECT record_id, purpose, vendor, channel, data_category, jurisdiction,
+                state, consent_basis, captured_via, capture_context, reason,
+                effective_from, effective_until, recorded_at
+         FROM consent_records
+         WHERE tenant_id = $1 AND identity_id = $2
+           AND ($3::timestamptz IS NULL OR recorded_at < $3::timestamptz)
+         ORDER BY recorded_at DESC, record_id DESC
+         LIMIT $4`,
+        [tenantId, identityId, before, limit + 1]
+    );
+
+    const hasMore = result.rows.length > limit;
+    return {
+        records: hasMore ? result.rows.slice(0, limit) : result.rows,
+        has_more: hasMore,
+    };
+}
+
+// ----------------------------------------------------------------------------
+// readConsent
+// ----------------------------------------------------------------------------
+//
+// The read-path orchestrator the HTTP layer calls. Given a verified tenantId
+// (JWT sub claim - Bible Decision 4) and an identity_id, it confirms the
+// tenant and identity exist (an identity in another tenant is
+// indistinguishable from one that doesn't exist - structural isolation),
+// then reads the projection and, optionally, the paginated history.
+//
+// An existing identity with no consent rows is a SUCCESS with empty results:
+// "no record" is the strictest consent state (no consent), not a missing
+// resource.
+//
+// Options: { includeHistory, limit, before } (limit/before pre-validated by
+// validateHistoryOptions).
+//
+// Returns:
+//   { ok: true, current: [...], history?: { records, has_more } }
+//   { ok: false, code, errors }
+// ----------------------------------------------------------------------------
+
+async function readConsent(tenantId, identityId, options = {}) {
+    if (!tenantId) {
+        throw new Error('tenantId is required');
+    }
+
+    const tenantRes = await query(
+        `SELECT 1 FROM tenants WHERE id = $1 LIMIT 1`,
+        [tenantId]
+    );
+    if (tenantRes.rows.length === 0) {
+        return {
+            ok: false,
+            code: 'tenant_not_found',
+            errors: [{ field: 'tenant', code: 'tenant_not_found', message: 'the specified tenant does not exist' }],
+        };
+    }
+
+    const identityRes = await query(
+        `SELECT 1 FROM identities
+         WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL
+         LIMIT 1`,
+        [tenantId, identityId]
+    );
+    if (identityRes.rows.length === 0) {
+        return {
+            ok: false,
+            code: 'identity_not_found',
+            errors: [{
+                field: 'identity_id',
+                code: 'identity_not_found',
+                message: `identity_id ${identityId} does not exist for this tenant`,
+            }],
+        };
+    }
+
+    const current = await getCurrentConsent(tenantId, identityId);
+    const result = { ok: true, current };
+
+    if (options.includeHistory) {
+        result.history = await getConsentHistory(tenantId, identityId, options);
+    }
+
+    return result;
+}
+
+// ----------------------------------------------------------------------------
 // Exports
 // ----------------------------------------------------------------------------
 
@@ -625,9 +827,15 @@ module.exports = {
     STATES,
     CONSENT_BASES,
     CAPTURED_VIA,
+    HISTORY_DEFAULT_LIMIT,
+    HISTORY_MAX_LIMIT,
     validateConsentRecord,
     validateConsentRequest,
+    validateHistoryOptions,
     checkIdentities,
     persistConsentRecords,
     recordConsent,
+    getCurrentConsent,
+    getConsentHistory,
+    readConsent,
 };

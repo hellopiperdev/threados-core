@@ -231,13 +231,14 @@ Phase B in progress:
   [~] Step 7: Consent management
         Session 1 ✓ data model (consent_records history + current_consent projection)
         Session 2 ✓ recording API (POST /api/v1/consent, projection maintenance)
+        Session 3 ✓ read API (GET /api/v1/consent/:identity_id, history pagination)
         Remaining: write-time enforcement in event capture + Step 6 backfill
   [ ] Step 8: Audit logging pipeline
   [ ] Step 9: Loyalty wallet
   [ ] Step 10: Production deployment to GCP
 ```
 
-Total tests passing: 729. Latest commit on `main` at time of writing: `02093e2`.
+Total tests passing: 806. Latest commit on `main` at time of writing: `0478835`.
 
 Step 7's remaining work must backfill `consent_snapshot` values for events captured in Step 6 (findable via `consent_snapshot->>'status' = 'not_evaluated'`).
 

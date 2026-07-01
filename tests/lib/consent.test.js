@@ -22,7 +22,11 @@ const {
     MAX_BATCH_SIZE,
     validateConsentRecord,
     validateConsentRequest,
+    validateHistoryOptions,
     recordConsent,
+    getCurrentConsent,
+    getConsentHistory,
+    readConsent,
 } = require('../../src/lib/consent');
 
 // ----------------------------------------------------------------------------
@@ -481,6 +485,122 @@ async function runTests() {
         test('validation failure short-circuits with validation_failed',
             invalidBatch.code, 'validation_failed');
         test('validation failure persisted nothing', await historyCount(), before);
+
+        // --------------------------------------------------------------------
+        section('validateHistoryOptions: pagination parameters');
+        // --------------------------------------------------------------------
+
+        const defaults = validateHistoryOptions({});
+        test('defaults: limit 100', defaults.value.limit, 100);
+        test('defaults: before null', defaults.value.before, null);
+
+        test('numeric-string limit accepted (query params arrive as strings)',
+            validateHistoryOptions({ limit: '50' }).value.limit, 50);
+        test('limit at the max accepted',
+            validateHistoryOptions({ limit: '500' }).value.limit, 500);
+        test('limit over the max rejected, not clamped',
+            validateHistoryOptions({ limit: '501' }).errors[0].code, 'invalid_value');
+        test('limit zero rejected',
+            validateHistoryOptions({ limit: '0' }).errors[0].code, 'invalid_value');
+        test('non-integer limit rejected',
+            validateHistoryOptions({ limit: '2.5' }).errors[0].code, 'invalid_format');
+        test('non-numeric limit rejected',
+            validateHistoryOptions({ limit: 'lots' }).errors[0].code, 'invalid_format');
+        test('repeated limit param (array) rejected',
+            validateHistoryOptions({ limit: ['5', '10'] }).errors[0].code, 'invalid_format');
+
+        test('valid before normalized to canonical ISO',
+            validateHistoryOptions({ before: '2026-06-01T00:00:00Z' }).value.before,
+            '2026-06-01T00:00:00.000Z');
+        test('unparseable before rejected',
+            validateHistoryOptions({ before: 'last tuesday' }).errors[0].code, 'invalid_format');
+        test('bad limit and bad before both reported',
+            validateHistoryOptions({ limit: 'x', before: 'y' }).errors.length, 2);
+
+        // A consent-free identity for empty-state reads.
+        const readIdn = await query(
+            `INSERT INTO identities (tenant_id, email_hash, resolution_key, match_source)
+             VALUES ($1, $2, $3, 'deterministic') RETURNING id`,
+            [tenantId, '5'.repeat(64), '6'.repeat(64)]
+        );
+        const readIdentityId = readIdn.rows[0].id;
+
+        // --------------------------------------------------------------------
+        section('getCurrentConsent: projection reads');
+        // --------------------------------------------------------------------
+
+        test('identity with no consent reads as empty (no consent, not an error)',
+            await getCurrentConsent(tenantId, readIdentityId), []);
+
+        // State accumulated above: marketing/email (granted), marketing/sms
+        // (denied), analytics/email (granted), analytics/push (denied).
+        const currentRows = await getCurrentConsent(tenantId, identityId);
+        test('all currently-effective tuples returned', currentRows.length, 4);
+        test('rows come back in deterministic dimension order (purpose first)',
+            currentRows.map(r => `${r.purpose}/${r.channel}`),
+            ['analytics/email', 'analytics/push', 'marketing/email', 'marketing/sms']);
+        testThat('rows carry the full decision (state, basis, effective_from, source)',
+            currentRows.every(r => r.state && r.consent_basis && r.effective_from && r.source_record_id));
+
+        test('projection read is tenant-scoped: other tenant sees nothing',
+            await getCurrentConsent(otherTenantId, identityId), []);
+
+        // --------------------------------------------------------------------
+        section('getConsentHistory: ordering and pagination');
+        // --------------------------------------------------------------------
+
+        const fullHistory = await getConsentHistory(tenantId, identityId);
+        test('full history returned under the default limit', fullHistory.records.length, 10);
+        test('full history reports has_more false', fullHistory.has_more, false);
+        testThat('history is ordered recorded_at DESC',
+            fullHistory.records.every((r, i, arr) =>
+                i === 0 || arr[i - 1].recorded_at >= r.recorded_at));
+        testThat('history rows carry the full record (context, reason, valid time)',
+            fullHistory.records.every(r =>
+                r.record_id && r.capture_context && r.reason && r.effective_from !== undefined));
+
+        const limited = await getConsentHistory(tenantId, identityId, { limit: 3 });
+        test('limit truncates the page', limited.records.length, 3);
+        test('truncated page reports has_more true', limited.has_more, true);
+
+        // Keyset pagination: everything strictly before the newest timestamp.
+        // The two newest rows (the multi-tuple batch) share one recorded_at, so
+        // this also exercises the exclusive cursor against a timestamp tie.
+        const newestTs = fullHistory.records[0].recorded_at;
+        const olderPage = await getConsentHistory(tenantId, identityId,
+            { before: newestTs.toISOString() });
+        test('before cursor excludes the cursor timestamp (exclusive)',
+            olderPage.records.length, 8);
+        testThat('paged records do not overlap the newer ones',
+            olderPage.records.every(r => r.recorded_at < newestTs));
+
+        test('history read is tenant-scoped: other tenant sees nothing',
+            (await getConsentHistory(otherTenantId, identityId)).records, []);
+        test('empty history for a consent-free identity',
+            (await getConsentHistory(tenantId, readIdentityId)).records, []);
+
+        // --------------------------------------------------------------------
+        section('readConsent: orchestration');
+        // --------------------------------------------------------------------
+
+        test('nonexistent tenant rejected on read',
+            (await readConsent(crypto.randomUUID(), identityId)).code, 'tenant_not_found');
+        test('nonexistent identity rejected on read',
+            (await readConsent(tenantId, crypto.randomUUID())).code, 'identity_not_found');
+        test('another tenant\'s identity rejected on read (structural isolation)',
+            (await readConsent(tenantId, otherTenantIdentityId)).code, 'identity_not_found');
+        test('soft-deleted identity rejected on read',
+            (await readConsent(tenantId, deletedIdentityId)).code, 'identity_not_found');
+
+        const emptyRead = await readConsent(tenantId, readIdentityId);
+        test('existing identity with no consent reads ok', emptyRead.ok, true);
+        test('empty read returns an empty current set', emptyRead.current, []);
+        test('history omitted unless requested', emptyRead.history, undefined);
+
+        const fullRead = await readConsent(tenantId, identityId, { includeHistory: true, limit: 3 });
+        test('read returns the current projection', fullRead.current.length, 4);
+        test('read honors the history limit', fullRead.history.records.length, 3);
+        test('read reports has_more for the truncated history', fullRead.history.has_more, true);
 
     } catch (err) {
         failed++;

@@ -408,6 +408,161 @@ async function runTests() {
         testThat('X-Service header present on responses',
             single.headers['x-service'] === 'threados-core');
 
+        // --------------------------------------------------------------------
+        section('GET: auth and validation');
+        // --------------------------------------------------------------------
+
+        const getPath = (id, qs = '') => `${PATH}/${id}${qs}`;
+
+        const getNoAuth = await request(
+            { method: 'GET', path: getPath(testIdentityId) }, undefined, null);
+        test('GET without auth returns 401', getNoAuth.statusCode, 401);
+
+        const getBadUuid = await request(
+            { method: 'GET', path: getPath('not-a-uuid') }, undefined, validToken);
+        test('GET with malformed identity_id returns 400', getBadUuid.statusCode, 400);
+        test('malformed identity_id wrapped as validation_failed',
+            getBadUuid.body.error.code, 'validation_failed');
+        testThat('details anchor the identity_id field',
+            getBadUuid.body.error.details.some(d => d.field === 'identity_id'));
+
+        const getBadInclude = await request(
+            { method: 'GET', path: getPath(testIdentityId, '?include=histroy') },
+            undefined, validToken);
+        test('unknown include value returns 400 (rejected, not ignored)',
+            getBadInclude.statusCode, 400);
+        testThat('include error is actionable',
+            getBadInclude.body.error.details.some(d => d.field === 'include' && d.code === 'invalid_value'));
+
+        const strayLimit = await request(
+            { method: 'GET', path: getPath(testIdentityId, '?limit=10') },
+            undefined, validToken);
+        test('limit without include=history returns 400', strayLimit.statusCode, 400);
+
+        const getBadLimit = await request(
+            { method: 'GET', path: getPath(testIdentityId, '?include=history&limit=501') },
+            undefined, validToken);
+        test('limit over 500 returns 400', getBadLimit.statusCode, 400);
+        testThat('limit error carries invalid_value',
+            getBadLimit.body.error.details.some(d => d.field === 'limit' && d.code === 'invalid_value'));
+
+        const getBadBefore = await request(
+            { method: 'GET', path: getPath(testIdentityId, '?include=history&before=whenever') },
+            undefined, validToken);
+        test('unparseable before returns 400', getBadBefore.statusCode, 400);
+
+        // --------------------------------------------------------------------
+        section('GET: referenced entities (the 404-vs-422 rule)');
+        // --------------------------------------------------------------------
+
+        const getGhostTenant = await request(
+            { method: 'GET', path: getPath(testIdentityId) }, undefined, ghostTenantToken);
+        test('GET with a nonexistent-tenant JWT returns 404', getGhostTenant.statusCode, 404);
+        test('nonexistent tenant has tenant_not_found code',
+            getGhostTenant.body.error.code, 'tenant_not_found');
+
+        const getGhostIdentity = await request(
+            { method: 'GET', path: getPath(crypto.randomUUID()) }, undefined, validToken);
+        test('GET of a nonexistent identity returns 422', getGhostIdentity.statusCode, 422);
+        test('nonexistent identity has identity_not_found code',
+            getGhostIdentity.body.error.code, 'identity_not_found');
+
+        const getCrossTenant = await request(
+            { method: 'GET', path: getPath(otherTenantIdentityId) }, undefined, validToken);
+        test('another tenant\'s identity is unreadable via this token (isolation)',
+            getCrossTenant.statusCode, 422);
+
+        // --------------------------------------------------------------------
+        section('GET: empty state is a 200, not a missing resource');
+        // --------------------------------------------------------------------
+
+        const bareIdn = await query(
+            `INSERT INTO identities (tenant_id, email_hash, resolution_key, match_source)
+             VALUES ($1, $2, $3, 'deterministic') RETURNING id`,
+            [testTenantId, '7'.repeat(64), '8'.repeat(64)]
+        );
+        const bareIdentityId = bareIdn.rows[0].id;
+
+        const emptyGet = await request(
+            { method: 'GET', path: getPath(bareIdentityId) }, undefined, validToken);
+        test('identity with no consent returns 200', emptyGet.statusCode, 200);
+        test('empty state returns an empty consent object', emptyGet.body.consent, {});
+        test('identity_id echoed back', emptyGet.body.identity_id, bareIdentityId);
+        test('no history key without include=history', emptyGet.body.history, undefined);
+
+        const emptyWithHistory = await request(
+            { method: 'GET', path: getPath(bareIdentityId, '?include=history') },
+            undefined, validToken);
+        test('empty state with include=history returns empty records',
+            emptyWithHistory.body.history.records, []);
+        test('empty history reports has_more false',
+            emptyWithHistory.body.history.has_more, false);
+
+        // --------------------------------------------------------------------
+        section('GET: current consent, purpose-grouped');
+        // --------------------------------------------------------------------
+
+        // State from the POST tests above: marketing/email withdrawn,
+        // marketing/sms granted (push was future-dated - projection untouched).
+        const currentGet = await request(
+            { method: 'GET', path: getPath(testIdentityId) }, undefined, validToken);
+        test('GET current returns 200', currentGet.statusCode, 200);
+        test('consent grouped by purpose',
+            Object.keys(currentGet.body.consent), ['marketing']);
+        test('purpose group carries one entry per remaining dimension tuple',
+            currentGet.body.consent.marketing.length, 2);
+
+        const byChannel = Object.fromEntries(
+            currentGet.body.consent.marketing.map(e => [e.channel, e]));
+        test('email tuple reflects the superseding withdrawal',
+            byChannel.email.state, 'withdrawn');
+        test('sms tuple reflects its grant', byChannel.sms.state, 'granted');
+        testThat('entries carry the full tuple + decision',
+            currentGet.body.consent.marketing.every(e =>
+                e.vendor && e.channel && e.data_category && e.jurisdiction &&
+                e.state && e.consent_basis && e.effective_from && e.source_record_id));
+        test('future-dated push tuple absent from current consent',
+            byChannel.push, undefined);
+
+        // --------------------------------------------------------------------
+        section('GET: history and pagination');
+        // --------------------------------------------------------------------
+
+        const withHistory = await request(
+            { method: 'GET', path: getPath(testIdentityId, '?include=history') },
+            undefined, validToken);
+        test('include=history returns the full history', withHistory.body.history.records.length, 4);
+        test('full history reports has_more false', withHistory.body.history.has_more, false);
+        testThat('history ordered recorded_at DESC',
+            withHistory.body.history.records.every((r, i, arr) =>
+                i === 0 || arr[i - 1].recorded_at >= r.recorded_at));
+        testThat('current consent still present alongside history',
+            Object.keys(withHistory.body.consent).length === 1);
+
+        // Pagination against distinct timestamps: three sequential single-record
+        // POSTs (separate transactions) give three distinct recorded_at values.
+        for (const state of ['granted', 'denied', 'granted']) {
+            const page = await request({ method: 'POST', path: PATH },
+                makeRecord({ identity_id: bareIdentityId, state }), validToken);
+            test(`seed POST for pagination accepted (${state})`, page.statusCode, 201);
+        }
+
+        const page1 = await request(
+            { method: 'GET', path: getPath(bareIdentityId, '?include=history&limit=2') },
+            undefined, validToken);
+        test('limit=2 returns two records', page1.body.history.records.length, 2);
+        test('truncated page reports has_more true', page1.body.history.has_more, true);
+
+        const cursor = page1.body.history.records[1].recorded_at;
+        const page2 = await request(
+            { method: 'GET', path: getPath(bareIdentityId, `?include=history&before=${encodeURIComponent(cursor)}`) },
+            undefined, validToken);
+        test('before cursor returns the remaining record', page2.body.history.records.length, 1);
+        test('final page reports has_more false', page2.body.history.has_more, false);
+        testThat('pages do not overlap',
+            !page1.body.history.records.some(r =>
+                r.record_id === page2.body.history.records[0].record_id));
+
     } catch (err) {
         failed++;
         console.error(`\n${colors.red}Test run aborted:${colors.reset}`, err);
