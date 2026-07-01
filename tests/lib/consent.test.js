@@ -506,6 +506,14 @@ async function runTests() {
             validateHistoryOptions({ limit: '2.5' }).errors[0].code, 'invalid_format');
         test('non-numeric limit rejected',
             validateHistoryOptions({ limit: 'lots' }).errors[0].code, 'invalid_format');
+        test('scientific-notation limit rejected (canonical digits only)',
+            validateHistoryOptions({ limit: '1e2' }).errors[0].code, 'invalid_format');
+        test('hex limit rejected',
+            validateHistoryOptions({ limit: '0x64' }).errors[0].code, 'invalid_format');
+        test('whitespace-padded limit rejected',
+            validateHistoryOptions({ limit: ' 50' }).errors[0].code, 'invalid_format');
+        test('integer NUMBER still accepted (direct lib callers)',
+            validateHistoryOptions({ limit: 50 }).value.limit, 50);
         test('repeated limit param (array) rejected',
             validateHistoryOptions({ limit: ['5', '10'] }).errors[0].code, 'invalid_format');
 

@@ -528,7 +528,11 @@ async function checkConsent(client, tenantId, posture, events, purposesByName) {
             errors.push({
                 field: 'event',
                 code: 'consent_denied',
-                message: `event capture requires consent for purpose "${purpose}" over behavioral data (${decision.reason})`,
+                // The hint names the sanctioned diagnostic without leaking
+                // WHICH consent row decided (Session 5, named scenario 3):
+                // the vertical is authorized to read the identity's full
+                // consent state, so actionability costs nothing.
+                message: `event capture requires consent for purpose "${purpose}" over behavioral data (${decision.reason}); inspect the identity's consent state via GET /api/v1/consent/:identity_id`,
                 index,
             });
             snapshots.push(null);

@@ -451,6 +451,12 @@ async function runTests() {
             undefined, validToken);
         test('unparseable before returns 400', getBadBefore.statusCode, 400);
 
+        const getSciLimit = await request(
+            { method: 'GET', path: getPath(testIdentityId, '?include=history&limit=1e2') },
+            undefined, validToken);
+        test('scientific-notation limit returns 400 (canonical digits only)',
+            getSciLimit.statusCode, 400);
+
         // --------------------------------------------------------------------
         section('GET: referenced entities (the 404-vs-422 rule)');
         // --------------------------------------------------------------------

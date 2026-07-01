@@ -669,11 +669,17 @@ function validateHistoryOptions(raw = {}) {
     const value = { limit: HISTORY_DEFAULT_LIMIT, before: null };
 
     if (raw.limit !== undefined && raw.limit !== null && raw.limit !== '') {
-        // Accept a number or a numeric string (query params arrive as strings).
-        // A repeated query param arrives as an array - wrong type, reject.
-        const limitNum = (typeof raw.limit === 'string' || typeof raw.limit === 'number')
-            ? Number(raw.limit)
-            : NaN;
+        // Accept an integer number or a CANONICAL decimal-digit string (query
+        // params arrive as strings). Strict /^\d+$/ per the gatekeeper
+        // principle - Number() coercion would also admit '1e2', '0x64', and
+        // whitespace-padded forms (Session 5 finding LOW-1). A repeated query
+        // param arrives as an array - wrong type, reject.
+        let limitNum = NaN;
+        if (typeof raw.limit === 'number') {
+            limitNum = raw.limit;
+        } else if (typeof raw.limit === 'string' && /^\d+$/.test(raw.limit)) {
+            limitNum = Number(raw.limit);
+        }
         if (!Number.isInteger(limitNum)) {
             errors.push({ field: 'limit', code: 'invalid_format', message: 'limit must be an integer' });
         } else if (limitNum < 1 || limitNum > HISTORY_MAX_LIMIT) {

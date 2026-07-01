@@ -571,6 +571,8 @@ async function runTests() {
             !noRecord.ok && noRecord.code === 'consent_denied');
         testThat('rejection message names the reason',
             noRecord.errors[0].message.includes('no_consent_record'));
+        testThat('rejection message points at the consent read API (diagnostic hint)',
+            noRecord.errors[0].message.includes('GET /api/v1/consent/:identity_id'));
 
         const deniedIdn = await mkIdentity();
         await seedConsent(deniedIdn, { state: 'denied' });

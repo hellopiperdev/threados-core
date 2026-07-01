@@ -242,7 +242,7 @@ Phase B in progress:
   [ ] Step 10: Production deployment to GCP
 ```
 
-Total tests passing: 903. Latest commit on `main` at time of writing: `be627d0`.
+Total tests passing: 909. Latest commit on `main` at time of writing: `46488bc`.
 
 The Step 6 consent-snapshot backfill is implemented as `scripts/backfill-consent-snapshots.js` (idempotent, `--dry-run` supported); run it against any environment still holding `consent_snapshot->>'status' = 'not_evaluated'` rows.
 
