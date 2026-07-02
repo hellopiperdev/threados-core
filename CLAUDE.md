@@ -228,21 +228,17 @@ Phase A: COMPLETE (Steps 1-4)
 Phase B in progress:
   [✓] Step 5: JWT authentication (5 sessions + prerequisite)
   [✓] Step 6: Event capture API (3 sessions)
-  [~] Step 7: Consent management
-        Session 1 ✓ data model (consent_records history + current_consent projection)
-        Session 2 ✓ recording API (POST /api/v1/consent, projection maintenance)
-        Session 3 ✓ read API (GET /api/v1/consent/:identity_id, history pagination)
-        Session 4 ✓ write-time enforcement (rule map, 403/503) + Step 6 backfill
-        Session 5 ✓ robustness exploration + fixes (projection expiry HIGH-1,
-        future-activation position MEDIUM-1, gatekeeper polish)
-        Remaining: Session 6 API documentation (docs/api/consent.md, incl. the
-        backdated-withdrawal and future-activation positions)
+  [✓] Step 7: Consent management (6 sessions: data model, recording API,
+      read API, write-time enforcement + backfill, robustness + fixes,
+      API documentation)
   [ ] Step 8: Audit logging pipeline
   [ ] Step 9: Loyalty wallet
   [ ] Step 10: Production deployment to GCP
 ```
 
-Total tests passing: 909. Latest commit on `main` at time of writing: `46488bc`.
+Total tests passing: 909. Latest commit on `main` at time of writing: `8730503`.
+
+Step 8 (audit logging pipeline) is next.
 
 The Step 6 consent-snapshot backfill is implemented as `scripts/backfill-consent-snapshots.js` (idempotent, `--dry-run` supported); run it against any environment still holding `consent_snapshot->>'status' = 'not_evaluated'` rows.
 
