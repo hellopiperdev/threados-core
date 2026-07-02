@@ -103,7 +103,8 @@ router.post('/hash', requireJsonContent, requireSignedRequest, async (req, res, 
         // Resolve (find or create) the identity
         const { identity, created } = await resolveIdentity(
             req.tenantId,
-            validation.value
+            validation.value,
+            req.verticalSlug
         );
 
         // Verify the tenant actually exists. If the tenant_id was syntactically

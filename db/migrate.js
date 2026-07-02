@@ -147,6 +147,7 @@ async function runMigration() {
             'identities',
             'consent_records',
             'current_consent',
+            'audit_log',
             'event_type_registry',
             'events',
             'customers',

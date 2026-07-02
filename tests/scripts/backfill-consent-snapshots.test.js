@@ -24,7 +24,10 @@ const crypto = require('crypto');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const { query, shutdown } = require('../../src/lib/db');
-const { recordConsent } = require('../../src/lib/consent');
+const { recordConsent: recordConsentRaw } = require('../../src/lib/consent');
+
+// Step 8: consent writes carry an actor for the audit trail.
+const recordConsent = (t, b, actor = '_test_backfill') => recordConsentRaw(t, b, actor);
 
 const SCRIPT = path.join(__dirname, '../../scripts/backfill-consent-snapshots.js');
 const TEST_TENANT_SLUG = '_test_tenant_backfill';
@@ -176,6 +179,8 @@ async function setup() {
 
 async function teardown() {
     try {
+        // audit_log has no FKs (by design) - clean explicitly.
+        if (tenantId) await query(`DELETE FROM audit_log WHERE tenant_id = $1`, [tenantId]);
         await query(`DELETE FROM tenants WHERE slug = $1`, [TEST_TENANT_SLUG]);
     } catch (err) {
         console.log(`${colors.yellow}⚠${colors.reset} Cleanup failed: ${err.message}`);
@@ -254,6 +259,11 @@ async function runTests() {
         const afterDry = await eventState(grantedThenWithdrawn.event_id);
         test('dry run left the placeholder in place',
             afterDry.consent_snapshot.status, 'not_evaluated');
+        const dryAudit = await query(
+            `SELECT count(*)::int AS n FROM audit_log
+             WHERE tenant_id = $1 AND audit_action = 'backfill_evaluated'`, [tenantId]);
+        test('dry run wrote no audit row (writes NOTHING per its contract)',
+            dryAudit.rows[0].n, 0);
 
         // --------------------------------------------------------------------
         section('Backfill: point-in-time evaluation');
@@ -302,6 +312,24 @@ async function runTests() {
         const s1Again = await eventState(grantedThenWithdrawn.event_id);
         test('second run left evaluated snapshots untouched',
             s1Again.consent_snapshot.evaluated_at, s1.consent_snapshot.evaluated_at);
+
+        // --------------------------------------------------------------------
+        section('Audit integration (Step 8): the run is on the record');
+        // --------------------------------------------------------------------
+
+        const runAudit = await query(
+            `SELECT actor, outcome, detail FROM audit_log
+             WHERE tenant_id = $1 AND audit_action = 'backfill_evaluated'`, [tenantId]);
+        test('exactly one backfill_evaluated row for the tenant (real run only)',
+            runAudit.rows.length, 1);
+        test('actor is the reserved core_backfill', runAudit.rows[0].actor, 'core_backfill');
+        testThat('detail carries the tenant\'s disposition counts',
+            runAudit.rows[0].detail.evaluated === 5 &&
+            runAudit.rows[0].detail.granted === 1 &&
+            runAudit.rows[0].detail.denied === 3 &&
+            runAudit.rows[0].detail.anonymous_holding === 1 &&
+            runAudit.rows[0].detail.denied_reasons.no_consent_record === 1,
+            JSON.stringify(runAudit.rows[0].detail));
 
     } catch (err) {
         failed++;

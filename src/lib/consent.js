@@ -35,9 +35,11 @@
 //                written.
 // ============================================================================
 
-const { query, withTransaction } = require('./db');
+const db = require('./db');
+const { query, withTransaction } = db;
 const { validateUuid, validateRequiredString } = require('./validation');
 const { scanForPii } = require('./pii');
+const { writeAudit, auditConsentRecorded, auditConsentRead } = require('./audit');
 
 // ----------------------------------------------------------------------------
 // Limits
@@ -602,7 +604,7 @@ async function persistConsentRecords(client, tenantId, records) {
 //     status.
 // ----------------------------------------------------------------------------
 
-async function recordConsent(tenantId, body) {
+async function recordConsent(tenantId, body, actor) {
     if (!tenantId) {
         throw new Error('tenantId is required');
     }
@@ -640,6 +642,17 @@ async function recordConsent(tenantId, body) {
         const results = await persistConsentRecords(client, tenantId, records);
         const created = results.filter(r => r.projection === 'created').length;
         const updated = results.filter(r => r.projection === 'updated').length;
+
+        // Audit rides the same transaction (Step 8, fail-closed): one row per
+        // API call - the call is the action, not the individual record. If
+        // this insert fails, the whole recording rolls back: a consent
+        // record Core cannot audit does not exist.
+        await writeAudit(client, auditConsentRecorded(actor, tenantId, {
+            recordIds: results.map(r => r.record_id),
+            identityIds: records.map(r => r.identity_id),
+            created,
+            updated,
+        }));
 
         return { ok: true, results, created, updated };
     });
@@ -849,6 +862,20 @@ async function readConsent(tenantId, identityId, options = {}) {
     if (options.includeHistory) {
         result.history = await getConsentHistory(tenantId, identityId, options);
     }
+
+    // Audit the disclosure (Step 8 decision 8.5: reads of consent state are
+    // audited). The read path has no transaction to ride - the queries above
+    // are reads - so the audit row is a single pool-level INSERT (atomic on
+    // its own), written AFTER the successful read and BEFORE the data is
+    // returned. Fail-closed still holds: if this insert throws, the error
+    // propagates, the route answers 5xx, and the consent state is never
+    // disclosed - the disclosure is the auditable action, and an unaudited
+    // disclosure does not happen.
+    await writeAudit(db, auditConsentRead(options.actor, tenantId, identityId, {
+        includedHistory: !!options.includeHistory,
+        currentTuples: current.length,
+        historyRecords: result.history ? result.history.records.length : undefined,
+    }));
 
     return result;
 }

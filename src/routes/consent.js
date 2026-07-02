@@ -132,7 +132,7 @@ function statusForRejection(code) {
 
 router.post('/', requireJsonContent, requireSignedRequest, async (req, res, next) => {
     try {
-        const result = await recordConsent(req.tenantId, req.body);
+        const result = await recordConsent(req.tenantId, req.body, req.verticalSlug);
 
         if (!result.ok) {
             return res.status(statusForRejection(result.code)).json({
@@ -289,6 +289,7 @@ router.get('/:identity_id', requireSignedRequest, async (req, res, next) => {
             includeHistory,
             limit: historyOptions.limit,
             before: historyOptions.before,
+            actor: req.verticalSlug,
         });
 
         if (!result.ok) {

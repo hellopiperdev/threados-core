@@ -25,10 +25,15 @@ const {
     validateEventsRequest,
     checkRegistry,
     checkIdentities,
-    captureEvents,
+    captureEvents: captureEventsRaw,
     MAX_BATCH_SIZE,
 } = require('../../src/lib/events');
-const { recordConsent } = require('../../src/lib/consent');
+const { recordConsent: recordConsentRaw } = require('../../src/lib/consent');
+
+// Step 8: every compliance write carries an actor for the audit trail.
+const TEST_ACTOR = '_test_events_lib';
+const captureEvents = (t, b, actor = TEST_ACTOR) => captureEventsRaw(t, b, actor);
+const recordConsent = (t, b, actor = TEST_ACTOR) => recordConsentRaw(t, b, actor);
 
 // ----------------------------------------------------------------------------
 // Test runner state
@@ -187,6 +192,9 @@ async function setup() {
 }
 
 async function teardown() {
+    // audit_log has no FKs (by design) - clean test audit rows explicitly.
+    await query(`DELETE FROM audit_log WHERE tenant_id = ANY($1)`,
+        [[tenantId, otherTenantId].filter(Boolean)]);
     await query(`DELETE FROM tenants WHERE slug IN ($1, $2)`,
         [TEST_TENANT_SLUG, TEST_TENANT_SLUG + '_other']);
     await shutdown();
@@ -744,6 +752,43 @@ async function runTests() {
         const afterStart = await captureEvents(tenantId, analyticsEvent(futIdn));
         testThat('capture still denied after the future start (documented position: write-time activation)',
             !afterStart.ok && afterStart.code === 'consent_denied');
+
+        // ---- Audit integration (Step 8): every capture outcome leaves a row ----
+        const lastAudit = async (action) => (await query(
+            `SELECT actor, outcome, outcome_reason, detail FROM audit_log
+             WHERE tenant_id = $1 AND audit_action = $2
+             ORDER BY occurred_at DESC, audit_id DESC LIMIT 1`, [tenantId, action])).rows[0];
+
+        const auditOkIdn = await mkIdentity();
+        await seedConsent(auditOkIdn);
+        const auditOkEvt = makeEvent({ identity_id: auditOkIdn });
+        await captureEvents(tenantId, [auditOkEvt, makeEvent()]);
+        const allowedRow = await lastAudit('capture_allowed');
+        testThat('capture_allowed row lands with actor + batch counts',
+            allowedRow && allowedRow.actor === TEST_ACTOR &&
+            allowedRow.outcome === 'success' &&
+            allowedRow.detail.event_count === 2 && allowedRow.detail.created === 2,
+            JSON.stringify(allowedRow));
+        testThat('capture_allowed detail carries the event ids',
+            allowedRow.detail.event_ids.includes(auditOkEvt.event_id));
+
+        await captureEvents(tenantId, analyticsEvent(await mkIdentity())); // no consent -> denied
+        const deniedRow = await lastAudit('capture_denied');
+        testThat('capture_denied row lands with the enforcement reason',
+            deniedRow && deniedRow.outcome === 'denied' &&
+            deniedRow.outcome_reason === 'no_consent_record' &&
+            deniedRow.detail.denied.length === 1,
+            JSON.stringify(deniedRow));
+
+        // The earlier fail-closed fault injection (current_consent renamed)
+        // produced a capture_unavailable refusal; its audit row was written
+        // best-effort AFTER the rollback, so it must exist even though the
+        // events do not.
+        const unavailableRow = await lastAudit('capture_unavailable');
+        testThat('capture_unavailable row recorded the refusal (post-rollback, best-effort)',
+            unavailableRow && unavailableRow.outcome === 'unavailable' &&
+            unavailableRow.outcome_reason === 'consent_check_unavailable',
+            JSON.stringify(unavailableRow));
 
     } finally {
         section('Teardown');

@@ -194,6 +194,9 @@ async function teardown() {
         await authHelper.teardownTestVertical(authCtx);
     }
     try {
+        // audit_log has no FKs (by design) - clean test audit rows explicitly.
+        await query(`DELETE FROM audit_log WHERE tenant_id = ANY($1)`,
+            [[testTenantId, otherTenantId].filter(Boolean)]);
         await query(`DELETE FROM tenants WHERE slug IN ($1, $2)`,
             [TEST_TENANT_SLUG, TEST_TENANT_SLUG + '_other']);
     } catch (err) {

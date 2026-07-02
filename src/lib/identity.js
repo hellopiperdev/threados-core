@@ -16,6 +16,7 @@
 // ============================================================================
 
 const { query, withTransaction } = require('./db');
+const { writeAudit, auditIdentityHashed } = require('./audit');
 const {
     hashPII,
     normalizePhone,
@@ -201,7 +202,7 @@ async function createIdentity(tenantId, identityData) {
 // email match (because email is checked first).
 // ----------------------------------------------------------------------------
 
-async function resolveIdentity(tenantId, identifiers) {
+async function resolveIdentity(tenantId, identifiers, actor) {
     if (!tenantId) {
         throw new Error('tenantId is required');
     }
@@ -211,6 +212,14 @@ async function resolveIdentity(tenantId, identifiers) {
     if (!email && !phone) {
         throw new Error('At least one of email or phone is required');
     }
+
+    // For the identity_hashed audit row (Step 8): which PII fields the
+    // caller provided. Names only - never values, never hashes.
+    const fieldsProvided = [
+        email ? 'email' : null,
+        phone ? 'phone' : null,
+        name ? 'name' : null,
+    ].filter(Boolean);
 
     // Hash the identifiers
     const emailHash = email ? hashPII(email) : null;
@@ -260,6 +269,13 @@ async function resolveIdentity(tenantId, identifiers) {
             }
 
             if (existing) {
+                // Audit rides the transaction (Step 8, fail-closed): PII was
+                // processed and an identity disclosed; if the audit insert
+                // fails the whole operation rolls back.
+                await writeAudit(client, auditIdentityHashed(actor, tenantId, existing.id, {
+                    created: false,
+                    fieldsProvided,
+                }));
                 return { identity: existing, created: false };
             }
 
@@ -290,6 +306,11 @@ async function resolveIdentity(tenantId, identifiers) {
                 ]
             );
 
+            await writeAudit(client, auditIdentityHashed(actor, tenantId, result.rows[0].id, {
+                created: true,
+                fieldsProvided,
+            }));
+
             return { identity: result.rows[0], created: true };
         });
     } catch (err) {
@@ -307,6 +328,15 @@ async function resolveIdentity(tenantId, identifiers) {
             );
 
             if (fallback.rows.length > 0) {
+                // The original transaction is gone, so the audit row cannot
+                // ride it; a single pool-level INSERT is atomic on its own.
+                // Fail-closed still holds: if this write throws, the error
+                // propagates and the identity is never disclosed.
+                await writeAudit({ query }, auditIdentityHashed(
+                    actor, tenantId, fallback.rows[0].id, {
+                        created: false,
+                        fieldsProvided,
+                    }));
                 return { identity: fallback.rows[0], created: false };
             }
         }

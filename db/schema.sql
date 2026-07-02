@@ -779,6 +779,61 @@ CREATE TRIGGER integrations_update_timestamp
 
 
 -- ============================================================================
+-- SECTION 9.5: Audit Log
+-- Bible: Decision 16 (audit logging; separate-infrastructure architecture is
+--        the production target - synchronous same-DB writes are the settled
+--        MVP posture), Decision 4 (tenant scoping)
+-- ============================================================================
+
+-- ----------------------------------------------------------------------------
+-- audit_log: Core's diary of its own compliance-relevant actions
+-- (mirrors migration 008)
+--
+-- One append-only row per action: who acted (actor), on whose behalf
+-- (tenant), on what subject (identity where applicable), doing what
+-- (action), with what outcome, when. Written for a hostile reader.
+--
+-- THE NO-FOREIGN-KEY RULE IS LOAD-BEARING: tenant_id and subject_identity_id
+-- are plain UUIDs with NO foreign keys so audit rows SURVIVE erasure
+-- cascades - a row about a deleted identity keeps its UUID as an opaque
+-- reference. Rows are never updated: one timestamp, no updated_at, no
+-- trigger. detail shapes are documented in src/lib/audit.js.
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS audit_log (
+    audit_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+
+    audit_action VARCHAR(30) NOT NULL
+        CHECK (audit_action IN ('consent_recorded', 'consent_read',
+                                'capture_allowed', 'capture_denied', 'capture_unavailable',
+                                'backfill_evaluated', 'identity_hashed')),
+
+    -- Vertical slug from the verified JWT iss claim, or 'core_backfill'.
+    actor VARCHAR(100) NOT NULL,
+
+    -- Deliberately NOT foreign keys (see table comment).
+    tenant_id UUID NOT NULL,
+    subject_identity_id UUID,
+
+    outcome VARCHAR(20) NOT NULL
+        CHECK (outcome IN ('success', 'denied', 'unavailable')),
+    outcome_reason VARCHAR(100),
+
+    detail JSONB NOT NULL DEFAULT '{}'
+        CHECK (length(detail::text) <= 4096),
+
+    occurred_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS audit_log_tenant_occurred
+    ON audit_log (tenant_id, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS audit_log_tenant_subject_occurred
+    ON audit_log (tenant_id, subject_identity_id, occurred_at DESC);
+
+COMMENT ON TABLE audit_log IS
+    'Append-only audit of compliance-relevant Core actions. tenant_id and subject_identity_id are deliberately NOT foreign keys: audit rows must survive erasure cascades - a row about a deleted identity keeps its UUID as an opaque reference. Rows are never updated. Bible Decision 16.';
+
+
+-- ============================================================================
 -- SECTION 10: Schema Migration Tracking
 -- ============================================================================
 
@@ -813,7 +868,8 @@ INSERT INTO schema_migrations (version, description) VALUES
     ('004_session_id_opaque', 'Retype events.session_id from UUID to VARCHAR(200): session_id is an opaque external identifier, not a Core-owned UUID'),
     ('005_consent_data_model', 'Replace placeholder consent_records with bitemporal append-only consent history + current_consent projection (Step 7 Session 1)'),
     ('006_event_type_implicated_purpose', 'Add implicated_purpose to event_type_registry: event types declare the consent purpose they implicate for write-time enforcement (Step 7 Session 4)'),
-    ('007_current_consent_effective_until', 'Add effective_until to current_consent so enforcement and reads can see expiry (Step 7 Session 5, finding HIGH-1)')
+    ('007_current_consent_effective_until', 'Add effective_until to current_consent so enforcement and reads can see expiry (Step 7 Session 5, finding HIGH-1)'),
+    ('008_audit_log', 'Add append-only audit_log: compliance-relevant Core actions with no-FK survivability across erasure cascades (Step 8 Session 1)')
 ON CONFLICT (version) DO NOTHING;
 
 

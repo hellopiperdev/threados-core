@@ -148,7 +148,7 @@ function statusForRejection(code) {
 
 router.post('/', requireJsonContent, requireSignedRequest, async (req, res, next) => {
     try {
-        const result = await captureEvents(req.tenantId, req.body);
+        const result = await captureEvents(req.tenantId, req.body, req.verticalSlug);
 
         if (!result.ok) {
             return res.status(statusForRejection(result.code)).json({

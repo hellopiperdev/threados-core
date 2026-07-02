@@ -433,3 +433,80 @@ WHERE cr.record_id = current_consent.source_record_id
 INSERT INTO schema_migrations (version, description)
 VALUES ('007_current_consent_effective_until', 'Add effective_until to current_consent so enforcement and reads can see expiry (Step 7 Session 5, finding HIGH-1)')
 ON CONFLICT (version) DO NOTHING;
+
+
+-- ============================================================================
+-- Migration 008: Audit log (Step 8 Session 1)
+-- ============================================================================
+--
+-- Core's diary of its own compliance-relevant actions, written for a hostile
+-- reader (a regulator, a lawyer, a future incident review): who acted
+-- (actor), on whose behalf (tenant), on what subject (identity where
+-- applicable), doing what (action), with what outcome, when. One append-only
+-- row per action. Not operator logs; not a mirror of the events table.
+--
+-- THE NO-FOREIGN-KEY RULE IS LOAD-BEARING: tenant_id and subject_identity_id
+-- are plain UUID columns with NO foreign keys, because audit rows must
+-- SURVIVE erasure cascades. When a right-to-erasure request deletes an
+-- identity (or a tenant is removed), the audit trail of what Core did on
+-- their behalf is precisely the record that must remain; the UUIDs become
+-- opaque references to entities that no longer exist, which is correct.
+--
+-- Rows are never updated - one timestamp (occurred_at), no updated_at, no
+-- trigger. detail is a bounded JSONB blob (<= 4096 chars serialized) whose
+-- shape is polymorphic per action; each action's shape is documented in
+-- src/lib/audit.js, which owns the authoritative constructors.
+--
+-- Synchronous, same-database, in-transaction writes are the settled MVP
+-- posture; Bible Decision 16's separate audit instance + async Pub/Sub
+-- pipeline is the production-hardening target (Step 10+, tracked).
+--
+-- Bible references:
+--   Decision 16: Audit logging (separate-infrastructure architecture is the
+--                production target; append-only + tamper-evidence intent
+--                applies now)
+--   Decision 4:  Tenant scoping - every row names the tenant it acted for.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS audit_log (
+    audit_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+
+    audit_action VARCHAR(30) NOT NULL
+        CHECK (audit_action IN ('consent_recorded', 'consent_read',
+                                'capture_allowed', 'capture_denied', 'capture_unavailable',
+                                'backfill_evaluated', 'identity_hashed')),
+
+    -- Who performed the action: the vertical slug from the verified JWT iss
+    -- claim, or the reserved value 'core_backfill' for the backfill script.
+    actor VARCHAR(100) NOT NULL,
+
+    -- Deliberately NOT foreign keys (see table comment).
+    tenant_id UUID NOT NULL,
+    subject_identity_id UUID,
+
+    outcome VARCHAR(20) NOT NULL
+        CHECK (outcome IN ('success', 'denied', 'unavailable')),
+    -- Machine reason for non-success outcomes (enforcement rule cell,
+    -- rejection code). Nullable: success rows usually need none.
+    outcome_reason VARCHAR(100),
+
+    -- Bounded polymorphic payload; shapes documented in src/lib/audit.js.
+    detail JSONB NOT NULL DEFAULT '{}'
+        CHECK (length(detail::text) <= 4096),
+
+    occurred_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Operator query pattern: "what happened for this tenant, newest first".
+CREATE INDEX IF NOT EXISTS audit_log_tenant_occurred
+    ON audit_log (tenant_id, occurred_at DESC);
+-- Per-identity audit review: "what did Core do regarding this person".
+CREATE INDEX IF NOT EXISTS audit_log_tenant_subject_occurred
+    ON audit_log (tenant_id, subject_identity_id, occurred_at DESC);
+
+COMMENT ON TABLE audit_log IS
+    'Append-only audit of compliance-relevant Core actions. tenant_id and subject_identity_id are deliberately NOT foreign keys: audit rows must survive erasure cascades - a row about a deleted identity keeps its UUID as an opaque reference. Rows are never updated. Bible Decision 16.';
+
+INSERT INTO schema_migrations (version, description)
+VALUES ('008_audit_log', 'Add append-only audit_log: compliance-relevant Core actions with no-FK survivability across erasure cascades (Step 8 Session 1)')
+ON CONFLICT (version) DO NOTHING;

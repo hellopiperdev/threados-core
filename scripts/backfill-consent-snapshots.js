@@ -44,6 +44,7 @@ require('dotenv').config();
 
 const { query, withTransaction, shutdown } = require('../src/lib/db');
 const { evaluateCapture } = require('../src/lib/enforcement');
+const { writeAudit, auditBackfillEvaluated } = require('../src/lib/audit');
 
 const colors = {
     reset: '\x1b[0m',
@@ -197,6 +198,10 @@ async function run() {
 
     const counts = { granted: 0, denied: 0, anonymous_holding: 0 };
     const deniedReasons = {};
+    // Per-tenant tallies for the backfill_evaluated audit rows: audit rows
+    // are tenant-scoped (tenant_id NOT NULL), so a run touching multiple
+    // tenants writes one row per tenant, each with that tenant's counts.
+    const perTenant = new Map();
     const purposeCache = new Map();
     let processed = 0;
 
@@ -224,6 +229,19 @@ async function run() {
                 counts[result.disposition]++;
                 if (result.disposition === 'denied') {
                     deniedReasons[result.reason] = (deniedReasons[result.reason] || 0) + 1;
+                }
+
+                if (!perTenant.has(evt.tenant_id)) {
+                    perTenant.set(evt.tenant_id, {
+                        evaluated: 0, granted: 0, denied: 0,
+                        anonymous_holding: 0, deniedReasons: {},
+                    });
+                }
+                const t = perTenant.get(evt.tenant_id);
+                t.evaluated++;
+                t[result.disposition]++;
+                if (result.disposition === 'denied') {
+                    t.deniedReasons[result.reason] = (t.deniedReasons[result.reason] || 0) + 1;
                 }
 
                 if (!DRY_RUN) {
@@ -255,6 +273,28 @@ async function run() {
         log.info(`denied because ${reason}: ${n}`);
     }
     log.success(`anonymous_holding: ${counts.anonymous_holding}`);
+
+    // Audit the run (Step 8): one backfill_evaluated row per tenant touched,
+    // actor core_backfill. A dry run writes NOTHING - including audit rows -
+    // per its contract; only runs that changed state are audited. An audit
+    // failure here exits non-zero: the evaluations are committed (per-batch
+    // transactions), so the operator must see that the run went unaudited.
+    if (!DRY_RUN && perTenant.size > 0) {
+        log.section('Audit');
+        await withTransaction(async (client) => {
+            for (const [tenantId, t] of perTenant) {
+                await writeAudit(client, auditBackfillEvaluated(tenantId, {
+                    evaluated: t.evaluated,
+                    granted: t.granted,
+                    denied: t.denied,
+                    anonymousHolding: t.anonymous_holding,
+                    deniedReasons: t.deniedReasons,
+                    dryRun: false,
+                }));
+            }
+        });
+        log.success(`${perTenant.size} backfill_evaluated audit row(s) written`);
+    }
 
     log.section('Done');
     if (DRY_RUN) {

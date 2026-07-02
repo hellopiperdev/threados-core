@@ -231,14 +231,17 @@ Phase B in progress:
   [✓] Step 7: Consent management (6 sessions: data model, recording API,
       read API, write-time enforcement + backfill, robustness + fixes,
       API documentation)
-  [ ] Step 8: Audit logging pipeline
+  [~] Step 8: Audit logging pipeline
+        Session 1 ✓ audit_log schema (no-FK survivability), src/lib/audit.js,
+        synchronous in-transaction integration into every compliance write
+        path (consent record/read, capture allow/deny/unavailable, identity
+        hash, backfill)
+        Remaining: robustness + documentation sessions per the step pattern
   [ ] Step 9: Loyalty wallet
   [ ] Step 10: Production deployment to GCP
 ```
 
-Total tests passing: 909. Latest commit on `main` at time of writing: `8730503`.
-
-Step 8 (audit logging pipeline) is next.
+Total tests passing: 998. Latest commit on `main` at time of writing: `b198ce4`.
 
 The Step 6 consent-snapshot backfill is implemented as `scripts/backfill-consent-snapshots.js` (idempotent, `--dry-run` supported); run it against any environment still holding `consent_snapshot->>'status' = 'not_evaluated'` rows.
 

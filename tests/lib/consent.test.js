@@ -23,11 +23,17 @@ const {
     validateConsentRecord,
     validateConsentRequest,
     validateHistoryOptions,
-    recordConsent,
+    recordConsent: recordConsentRaw,
     getCurrentConsent,
     getConsentHistory,
-    readConsent,
+    readConsent: readConsentRaw,
 } = require('../../src/lib/consent');
+
+// Step 8: every compliance write/read carries an actor for the audit trail.
+// Wrap the lib entry points so the existing call sites stay untouched.
+const TEST_ACTOR = '_test_consent_lib';
+const recordConsent = (t, b, actor = TEST_ACTOR) => recordConsentRaw(t, b, actor);
+const readConsent = (t, id, opts = {}) => readConsentRaw(t, id, { actor: TEST_ACTOR, ...opts });
 
 // ----------------------------------------------------------------------------
 // Test runner state
@@ -156,6 +162,10 @@ async function setup() {
 
 async function teardown() {
     try {
+        // audit_log has no FKs (by design), so tenant deletion does not
+        // cascade to it - clean the test tenants' audit rows explicitly.
+        await query(`DELETE FROM audit_log WHERE tenant_id = ANY($1)`,
+            [[tenantId, otherTenantId].filter(Boolean)]);
         await query(`DELETE FROM tenants WHERE slug IN ($1, $2)`,
             [TEST_TENANT_SLUG, TEST_TENANT_SLUG + '_other']);
     } catch (err) {
@@ -667,6 +677,56 @@ async function runTests() {
         const revived = await getCurrentConsent(tenantId, vacIdn);
         test('projection shows the reviving record', revived.length, 1);
         test('reviving record is the visible decision', revived[0].state, 'granted');
+
+        // --------------------------------------------------------------------
+        section('Audit integration (Step 8): recording and reads leave rows');
+        // --------------------------------------------------------------------
+
+        const auditBefore = await query(
+            `SELECT count(*)::int AS n FROM audit_log
+             WHERE tenant_id = $1 AND audit_action = 'consent_recorded'`, [tenantId]);
+        testThat('every successful recordConsent above left a consent_recorded row',
+            auditBefore.rows[0].n > 0);
+
+        const auditIdn = await mkClockIdentity('b8');
+        await recordConsent(tenantId, [
+            makeRecord({ identity_id: auditIdn }),
+            makeRecord({ identity_id: auditIdn, channel: 'sms' }),
+        ]);
+        const recAudit = await query(
+            `SELECT actor, outcome, subject_identity_id, detail FROM audit_log
+             WHERE tenant_id = $1 AND audit_action = 'consent_recorded'
+             ORDER BY occurred_at DESC, audit_id DESC LIMIT 1`, [tenantId]);
+        test('consent_recorded actor is the caller', recAudit.rows[0].actor, TEST_ACTOR);
+        test('consent_recorded outcome', recAudit.rows[0].outcome, 'success');
+        test('one row per CALL: detail counts the whole batch',
+            recAudit.rows[0].detail.record_count, 2);
+        test('single-identity batch derives the audit subject',
+            recAudit.rows[0].subject_identity_id, auditIdn);
+
+        // A rejected recording leaves NO audit row (nothing happened).
+        const auditCount = async () => (await query(
+            `SELECT count(*)::int AS n FROM audit_log WHERE tenant_id = $1`, [tenantId])).rows[0].n;
+        const beforeRejected = await auditCount();
+        await recordConsent(tenantId, makeRecord({ identity_id: crypto.randomUUID() }));
+        test('a rejected recording writes no audit row', await auditCount(), beforeRejected);
+
+        // Reads are audited (decision 8.5).
+        await readConsent(tenantId, auditIdn, { includeHistory: true });
+        const readAudit = await query(
+            `SELECT actor, outcome, subject_identity_id, detail FROM audit_log
+             WHERE tenant_id = $1 AND audit_action = 'consent_read'
+             ORDER BY occurred_at DESC, audit_id DESC LIMIT 1`, [tenantId]);
+        test('consent_read row lands with the reader as actor',
+            readAudit.rows[0].actor, TEST_ACTOR);
+        test('consent_read subject is the identity read',
+            readAudit.rows[0].subject_identity_id, auditIdn);
+        test('consent_read detail records the disclosure scope',
+            readAudit.rows[0].detail.included_history, true);
+        testThat('consent_read detail counts what was disclosed',
+            readAudit.rows[0].detail.current_tuples === 2 &&
+            readAudit.rows[0].detail.history_records === 2,
+            JSON.stringify(readAudit.rows[0].detail));
 
     } catch (err) {
         failed++;

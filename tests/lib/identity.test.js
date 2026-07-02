@@ -19,8 +19,11 @@ const {
     findIdentityByHash,
     getIdentityById,
     createIdentity,
-    resolveIdentity,
+    resolveIdentity: resolveIdentityRaw,
 } = require('../../src/lib/identity');
+
+// Step 8: identity resolution carries an actor for the audit trail.
+const resolveIdentity = (t, ids, actor = '_test_identity_lib') => resolveIdentityRaw(t, ids, actor);
 const { hashPII, normalizePhone } = require('../../src/lib/hashing');
 
 // ----------------------------------------------------------------------------
@@ -125,6 +128,12 @@ async function setupTestTenants() {
 }
 
 async function teardownTestTenants() {
+    // audit_log has no FKs (by design) - clean test audit rows explicitly.
+    await query(
+        `DELETE FROM audit_log WHERE tenant_id IN (
+            SELECT id FROM tenants WHERE slug IN ($1, $2))`,
+        [TEST_TENANT_SLUG, TEST_TENANT_SLUG + '_other']
+    );
     // ON DELETE CASCADE handles all the related identities
     await query(
         `DELETE FROM tenants WHERE slug IN ($1, $2)`,
@@ -284,6 +293,26 @@ async function runTests() {
             phone: '(555) 222-2222',
         });
         test('phone format normalization works', result4.identity.id, result1.identity.id);
+
+        // Audit integration (Step 8): every resolution above processed PII
+        // and disclosed an identity, so each left an identity_hashed row.
+        const hashAudits = await query(
+            `SELECT actor, outcome, subject_identity_id, detail FROM audit_log
+             WHERE tenant_id = $1 AND audit_action = 'identity_hashed'
+             ORDER BY occurred_at, audit_id`,
+            [testTenantId]);
+        test('one identity_hashed audit row per resolution so far', hashAudits.rows.length, 4);
+        test('audit actor is the caller', hashAudits.rows[0].actor, '_test_identity_lib');
+        test('audit subject is the resolved identity',
+            hashAudits.rows[0].subject_identity_id, result1.identity.id);
+        test('first resolution audited as a creation',
+            hashAudits.rows[0].detail.identity_created, true);
+        test('second resolution audited as a match, not a creation',
+            hashAudits.rows[1].detail.identity_created, false);
+        test('detail names the PII fields provided - names only, never values',
+            hashAudits.rows[0].detail.fields_provided, ['email', 'phone', 'name']);
+        testThat('no audit detail ever contains raw PII',
+            hashAudits.rows.every(r => !JSON.stringify(r.detail).includes('bob@example.com')));
 
         // --------------------------------------------------------------------
         // resolveIdentity - email-only or phone-only

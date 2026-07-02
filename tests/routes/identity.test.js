@@ -163,6 +163,8 @@ async function teardown() {
     }
     if (testTenantId) {
         try {
+            // audit_log has no FKs (by design) - clean explicitly.
+            await query(`DELETE FROM audit_log WHERE tenant_id = $1`, [testTenantId]);
             await query(`DELETE FROM tenants WHERE slug = $1`, [TEST_TENANT_SLUG]);
         } catch (err) {
             console.log(`${colors.yellow}⚠${colors.reset} Cleanup failed: ${err.message}`);

@@ -35,10 +35,17 @@
 //                the event, not a cross-session identity mechanism.
 // ============================================================================
 
-const { withTransaction } = require('./db');
+const db = require('./db');
+const { withTransaction } = db;
 const { validateUuid, validateOptionalOpaqueId, validateRequiredString } = require('./validation');
 const { detectPiiInScalar, scanForPii } = require('./pii');
 const { evaluateCapture } = require('./enforcement');
+const {
+    writeAudit,
+    auditCaptureAllowed,
+    auditCaptureDenied,
+    auditCaptureUnavailable,
+} = require('./audit');
 
 // ----------------------------------------------------------------------------
 // Limits
@@ -507,6 +514,7 @@ async function checkConsent(client, tenantId, posture, events, purposesByName) {
     }
 
     const errors = [];
+    const denials = [];
     const snapshots = [];
     const evaluatedAt = new Date().toISOString();
 
@@ -535,6 +543,7 @@ async function checkConsent(client, tenantId, posture, events, purposesByName) {
                 message: `event capture requires consent for purpose "${purpose}" over behavioral data (${decision.reason}); inspect the identity's consent state via GET /api/v1/consent/:identity_id`,
                 index,
             });
+            denials.push({ index, identity_id: evt.identity_id, purpose, reason: decision.reason });
             snapshots.push(null);
             return;
         }
@@ -550,7 +559,7 @@ async function checkConsent(client, tenantId, posture, events, purposesByName) {
     });
 
     if (errors.length > 0) {
-        return { ok: false, errors };
+        return { ok: false, errors, denials };
     }
     return { ok: true, snapshots };
 }
@@ -644,7 +653,7 @@ async function persistEvents(client, tenantId, events, snapshots) {
 // where `code` is a machine-readable category the route maps to an HTTP error.
 // ----------------------------------------------------------------------------
 
-async function captureEvents(tenantId, body) {
+async function captureEvents(tenantId, body, actor) {
     if (!tenantId) {
         throw new Error('tenantId is required');
     }
@@ -693,6 +702,13 @@ async function captureEvents(tenantId, body) {
             const consentCheck = await checkConsent(
                 client, tenantId, posture, events, registryCheck.purposesByName);
             if (!consentCheck.ok) {
+                // Audit the enforcement decision in the same (otherwise
+                // empty) transaction: the denial is a compliance decision
+                // and commits durably even though no events do.
+                await writeAudit(client, auditCaptureDenied(actor, tenantId, {
+                    eventCount: events.length,
+                    denials: consentCheck.denials,
+                }));
                 return { ok: false, code: 'consent_denied', errors: consentCheck.errors };
             }
 
@@ -700,11 +716,39 @@ async function captureEvents(tenantId, body) {
             const created = results.filter(r => r.status === 'created').length;
             const duplicates = results.filter(r => r.status === 'duplicate').length;
 
+            // Audit rides the capture transaction (Step 8, fail-closed): if
+            // this insert fails, the whole batch rolls back - a capture Core
+            // cannot audit does not happen.
+            await writeAudit(client, auditCaptureAllowed(actor, tenantId, {
+                eventIds: events.map(e => e.event_id),
+                identityIds: events.map(e => e.identity_id),
+                created,
+                duplicates,
+            }));
+
             return { ok: true, results, created, duplicates };
         });
     } catch (err) {
         if (err.consentCheckFailure) {
             // The transaction rolled back; nothing was persisted (fail-closed).
+            //
+            // AUDIT ORDERING (settled in the Session 1 report): this audit
+            // row records a REFUSAL, and the transaction it would have
+            // ridden is already aborted - so it is written best-effort in
+            // its own implicit transaction. If consent infrastructure is
+            // down, this write is itself at risk; if it also fails, the 503
+            // still returns. Rationale: fail-closed protects ACTIONS - here
+            // the action (capture) already did not happen, so there is
+            // nothing to close against. Demanding a durable audit row before
+            // answering would turn "cannot verify consent" into "cannot
+            // respond at all". console.error is the last-resort trace.
+            try {
+                await writeAudit(db, auditCaptureUnavailable(actor, tenantId, {
+                    eventCount: events.length,
+                }));
+            } catch (auditErr) {
+                console.error('capture_unavailable audit write failed (returning 503 regardless):', auditErr.message);
+            }
             return {
                 ok: false,
                 code: 'consent_check_unavailable',
